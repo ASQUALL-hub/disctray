@@ -33,7 +33,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
@@ -118,6 +118,7 @@ DWMWCP_DONOTROUND = 1
 DWMWA_BORDER_COLOR = 34
 DWMWA_COLOR_NONE = 0xFFFFFFFE
 WDA_EXCLUDEFROMCAPTURE = 0x11
+WDA_NONE = 0x0
 QUNS_RUNNING_D3D_FULL_SCREEN = 3
 
 # Shell surfaces that can cover the screen without being "a program in fullscreen".
@@ -128,16 +129,21 @@ SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"
 
 
 def prepare_glass_window(hwnd: int) -> bool:
-    """Square window corners (the card draws its own shape) and hide the window
-    from screen capture, so grabbing its own rectangle returns what is behind it."""
+    """Square window corners (the card draws its own shape), no Windows 11 border."""
     try:
         pref = ctypes.c_int(DWMWCP_DONOTROUND)
         dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ctypes.byref(pref), 4)
-        no_border = wt.DWORD(DWMWA_COLOR_NONE)   # Windows 11 would outline the square window
+        no_border = wt.DWORD(DWMWA_COLOR_NONE)
         dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, ctypes.byref(no_border), 4)
-        return bool(user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE))
+        return True
     except Exception:
         return False
+
+
+def set_capturable(hwnd: int, on: bool) -> bool:
+    """Visible to screenshots and recordings, or hidden from every capture (then the
+    glass can grab its own rectangle and see exactly what is behind it)."""
+    return bool(user32.SetWindowDisplayAffinity(hwnd, WDA_NONE if on else WDA_EXCLUDEFROMCAPTURE))
 
 
 def foreground_is_fullscreen() -> bool:
@@ -1507,24 +1513,64 @@ def _box_blur(a: np.ndarray, r: int, axis: int) -> np.ndarray:
     return (hi - lo) / (2 * r + 1)
 
 
-def blur_small(img: QImage, down: int, radius: int, saturation: float) -> QImage:
-    """Downscale, three box passes (close to a gaussian) and a saturation boost.
-    The result stays small: drawing it scaled up with smooth filtering is free blur."""
+def _small_array(img: QImage, down: int) -> np.ndarray:
     w, h = img.width(), img.height()
     small = img.scaled(max(1, w // down), max(1, h // down), Qt.IgnoreAspectRatio,
                        Qt.SmoothTransformation).convertToFormat(QImage.Format_RGB32)
     sw, sh = small.width(), small.height()
     a = np.frombuffer(small.constBits(), np.uint8, count=small.sizeInBytes())
-    a = a.reshape(sh, small.bytesPerLine() // 4, 4)[:, :sw, :3].astype(np.float32)
-    if radius > 0:
-        for _ in range(3):
-            a = _box_blur(_box_blur(a, radius, 0), radius, 1)
-    lum = (a @ np.array([0.114, 0.587, 0.299], np.float32))[..., None]
-    a = lum + (a - lum) * saturation
+    return a.reshape(sh, small.bytesPerLine() // 4, 4)[:, :sw, :3].astype(np.float32)
+
+
+def _to_qimage(a: np.ndarray) -> QImage:
+    sh, sw = a.shape[:2]
     out = np.empty((sh, sw, 4), np.uint8)
     out[..., :3] = np.clip(a, 0, 255)
     out[..., 3] = 255
     return QImage(out.data, sw, sh, sw * 4, QImage.Format_RGB32).copy()
+
+
+def fill_holes(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Fill the pixels where mask == 0 from their surroundings (push-pull): average
+    the known pixels down a pyramid until the hole is covered, then bring the coarse
+    colours back up, blending them in only where nothing was known."""
+    levels = []
+    c, m = img * mask[..., None], mask.astype(np.float32)
+    while True:
+        levels.append((c, m))
+        if m.min() > 0 or min(m.shape) <= 2:
+            break
+        h, w = m.shape
+        h2, w2 = (h + 1) // 2, (w + 1) // 2
+        c = np.pad(c, ((0, h2 * 2 - h), (0, w2 * 2 - w), (0, 0))).reshape(h2, 2, w2, 2, 3).sum(axis=(1, 3))
+        m = np.pad(m, ((0, h2 * 2 - h), (0, w2 * 2 - w))).reshape(h2, 2, w2, 2).sum(axis=(1, 3))
+    c, m = levels[-1]
+    fill = c / np.maximum(m, 1e-6)[..., None]
+    if (m <= 0).any():
+        fill[m <= 0] = (c.sum(axis=(0, 1)) / max(float(m.sum()), 1e-6))
+    for c, m in reversed(levels[:-1]):
+        h, w = m.shape
+        up = np.repeat(np.repeat(fill, 2, axis=0), 2, axis=1)[:h, :w]
+        up = _box_blur(_box_blur(up, 1, 0), 1, 1)
+        known = c / np.maximum(m, 1e-6)[..., None]
+        wgt = np.clip(m, 0, 1)[..., None]
+        fill = known * wgt + up * (1 - wgt)
+    return fill
+
+
+def frost_from(a: np.ndarray, radius: int, saturation: float) -> QImage:
+    """Three box passes (close to a gaussian) and a saturation boost."""
+    if radius > 0:
+        for _ in range(3):
+            a = _box_blur(_box_blur(a, radius, 0), radius, 1)
+    lum = (a @ np.array([0.114, 0.587, 0.299], np.float32))[..., None]
+    return _to_qimage(lum + (a - lum) * saturation)
+
+
+def blur_small(img: QImage, down: int, radius: int, saturation: float) -> QImage:
+    """Downscale, three box passes (close to a gaussian) and a saturation boost.
+    The result stays small: drawing it scaled up with smooth filtering is free blur."""
+    return frost_from(_small_array(img, down), radius, saturation)
 
 
 class _Dib:
@@ -1566,6 +1612,7 @@ class BackdropWorker(QThread):
         self.hwnd, self.dpr, self.hz = hwnd, dpr, hz
         self.boost = True        # speed up while something changes behind the window
         self.boost_hz = hz
+        self.inpaint = False     # our window is in the capture: rebuild what's behind it
         self.running = True
         self._latest = None
         self._lock = threading.Lock()
@@ -1594,8 +1641,16 @@ class BackdropWorker(QThread):
                         if dib is not None:
                             dib.close()
                         dib, prev = _Dib(w, h), None
-                    if dib.grab(x, y) and (prev is None or win != prev_win or not np.array_equal(dib.arr, prev)):
-                        prev, prev_win = dib.arr.copy(), win
+                    if dib.grab(x, y):
+                        frame = dib.arr
+                        if self.inpaint:   # our own (animated) card is in the picture: ignore it
+                            frame = frame.copy()
+                            frame[pad:h - pad, pad:w - pad] = 0
+                        changed = prev is None or win != prev_win or not np.array_equal(frame, prev)
+                    else:
+                        changed = False
+                    if changed:
+                        prev, prev_win = (frame if self.inpaint else frame.copy()), win
                         last_change = t0
                         frost, lens = self._layers(prev, pad)
                         with self._lock:
@@ -1611,6 +1666,19 @@ class BackdropWorker(QThread):
     def _layers(self, arr: np.ndarray, pad: int):
         h, w = arr.shape[:2]
         img = QImage(arr.data, w, h, w * 4, QImage.Format_RGB32)
+        if self.inpaint:
+            # The window is visible to capture, so the capture shows the card itself.
+            # Rebuild what's behind it from the surroundings instead (push-pull fill).
+            small = _small_array(img, 4)
+            sh, sw = small.shape[:2]
+            mask = np.ones((sh, sw), np.float32)
+            p0 = max(0, pad // 4 - 1)
+            mask[p0: sh - p0, p0: sw - p0] = 0
+            filled = fill_holes(small, mask)
+            frost = frost_from(filled, 4, 1.6)
+            inset = max(0, (pad - round(CAPTURE_PAD * self.dpr)) // 4)
+            lens = _to_qimage(filled[inset: sh - inset, inset: sw - inset])
+            return frost, lens
         frost = blur_small(img, down=4, radius=4, saturation=1.6)
         # the edge refracts only the near surroundings, softly blurred
         inset = pad - round(CAPTURE_PAD * self.dpr)
@@ -1636,7 +1704,9 @@ class Backdrop(QObject):
         self.serial = 0
         self.hz = 60
         self.boost = True
+        self.capturable = False
         self._worker: BackdropWorker | None = None
+        set_capturable(int(widget.winId()), False)
 
     def start(self):
         if self._worker is None:
@@ -1657,11 +1727,18 @@ class Backdrop(QObject):
         if self._worker is not None:
             self._configure(self._worker)
 
+    def set_capturable(self, on: bool):
+        self.capturable = on
+        set_capturable(int(self.widget.winId()), on)
+        if self._worker is not None:
+            self._configure(self._worker)
+
     def _configure(self, wk: BackdropWorker):
         screen = self.widget.screen() or QGuiApplication.primaryScreen()
         display_hz = round(screen.refreshRate()) if screen else 60
         wk.hz = self.hz
         wk.boost = self.boost
+        wk.inpaint = self.capturable
         # while things move: double the chosen rate (at least 120), never past the monitor
         wk.boost_hz = max(self.hz, min(display_hz, 360, max(self.hz * 2, 120)))
 
@@ -3414,6 +3491,11 @@ class DiscTrayApp(QObject):
         self.act_bouncy.setChecked(self.cfg.get("bouncy", True))
         self.act_bouncy.toggled.connect(self.set_bouncy)
         settings.addAction(self.act_bouncy)
+        self.act_capture = QAction("Show in screenshots && recordings", settings, checkable=True)
+        self.act_capture.setChecked(self.cfg.get("capturable", True))
+        self.act_capture.toggled.connect(self.set_capturable)
+        settings.addAction(self.act_capture)
+        self.set_capturable(self.act_capture.isChecked(), save=False)
         self.player.engine.normalize = self.act_norm.isChecked()
         self.pop.bouncy = self.act_bouncy.isChecked()
         settings.addSeparator()
@@ -3728,6 +3810,13 @@ class DiscTrayApp(QObject):
         self.player.engine.normalize = on
         self.cfg["normalize"] = on
         save_config(self.cfg)
+
+    def set_capturable(self, on: bool, save: bool = True):
+        for w in (self.panel, self.pop, self.hud):
+            w.backdrop.set_capturable(on)
+        if save:
+            self.cfg["capturable"] = on
+            save_config(self.cfg)
 
     def set_bouncy(self, on: bool):
         self.pop.bouncy = on

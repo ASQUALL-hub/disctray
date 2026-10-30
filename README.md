@@ -13,7 +13,8 @@ A tray-only music player for Windows. Drop an audio file on its tray icon and it
 - **Even loudness.** Volume normalization (on by default) measures every track the way streaming services do (EBU R128 / BS.1770) and plays them all at -14 LUFS, without clipping.
 - **Hi-Res.** Lossless files (FLAC, WAV, AIFF, ALAC...) get a small *Hi-Res* tag under the title.
 - **Throw it.** With *Bouncy pop-out* on, fling the pop-out and it keeps its momentum and bounces off the screen edges.
-- **Settings** (tray menu → Settings): volume normalization, bouncy pop-out, glass refresh rate, start with Windows.
+- **Settings** (tray menu → Settings): volume normalization, bouncy pop-out, show in screenshots & recordings, glass refresh rate, start with Windows.
+- **Screenshots and recordings.** DiscTray shows up in screenshots, OBS, Game Bar and other recorders. To capture itself without seeing its own card, the glass blends what's around the card into its middle. Turn *Show in screenshots & recordings* off for exact see-through glass; the player is then hidden from capture.
 - **Styles** (tray menu → Style):
   - **Glassy:** Liquid Glass-style squircles with live blur and edge refraction.
   - **Glossy Glass:** a glass record and glossy lettering.
