@@ -10,6 +10,10 @@ A tray-only music player for Windows. Drop an audio file on its tray icon and it
   - It pauses while another program is truly fullscreen and resumes afterwards.
   - Hold **Caps Lock** and the player fades to a ghost you can click straight through. If you only held it to click through, Caps Lock is switched back for you.
 - **Volume.** Hold **Ctrl** and scroll over the player for an iOS-style glass volume bar.
+- **Even loudness.** Volume normalization (on by default) measures every track the way streaming services do (EBU R128 / BS.1770) and plays them all at -14 LUFS, without clipping.
+- **Hi-Res.** Lossless files (FLAC, WAV, AIFF, ALAC...) get a small *Hi-Res* tag under the title.
+- **Throw it.** With *Bouncy pop-out* on, fling the pop-out and it keeps its momentum and bounces off the screen edges.
+- **Settings** (tray menu → Settings): volume normalization, bouncy pop-out, glass refresh rate, start with Windows.
 - **Styles** (tray menu → Style):
   - **Glassy:** Liquid Glass-style squircles with live blur and edge refraction.
   - **Glossy Glass:** a glass record and glossy lettering.

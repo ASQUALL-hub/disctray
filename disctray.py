@@ -33,7 +33,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
@@ -263,11 +263,15 @@ def set_startup(on: bool) -> None:
 
 # --------------------------------------------------------------------------- track metadata
 
+LOSSLESS_EXTS = {".flac", ".wav", ".aif", ".aiff", ".alac", ".wv", ".ape", ".dsf", ".dff"}
+
+
 @dataclass
 class TrackInfo:
     title: str
     length_ms: int
     art: QImage | None
+    hires: bool = False    # lossless (FLAC, WAV, AIFF, ALAC...)
 
 
 def _first_text(v) -> str | None:
@@ -312,11 +316,14 @@ def _tag_art(f, tags) -> bytes | None:
 
 def read_track(path: str) -> TrackInfo:
     title, length, art_bytes = Path(path).stem, 0, None
+    hires = Path(path).suffix.lower() in LOSSLESS_EXTS
     try:
         import mutagen
         f = mutagen.File(path)
         if f is not None:
             length = int((getattr(f.info, "length", 0) or 0) * 1000)
+            if str(getattr(f.info, "codec", "")).lower() == "alac":   # Apple Lossless inside .m4a
+                hires = True
             if f.tags is not None:
                 title = _tag_title(f.tags) or title
                 art_bytes = _tag_art(f, f.tags)
@@ -327,7 +334,7 @@ def read_track(path: str) -> TrackInfo:
         img = QImage.fromData(art_bytes)
         if not img.isNull():
             art = img
-    return TrackInfo(title, length, art)
+    return TrackInfo(title, length, art, hires)
 
 
 def accent_from(art: QImage | None, seed: int) -> QColor:
@@ -672,31 +679,176 @@ def engine_format(rate: int = ENGINE_RATE) -> QAudioFormat:
     return fmt
 
 
+NORM_TARGET_LUFS = -14.0   # what every track is brought to (same as Spotify's default)
+NORM_MAX_BOOST_DB = 10.0
+NORM_MAX_CUT_DB = 20.0
+# BS.1770 K-weighting: a high-shelf (how loud the ear finds the upper range) and a
+# high-pass (bass counts less). Coefficients are the standard 48 kHz design.
+_K_SHELF = ((1.53512485958697, -2.69169618940638, 1.19839281085285), (1.0, -1.69065929318241, 0.73248077421585))
+_K_HPF = ((1.0, -2.0, 1.0), (1.0, -1.99004745483398, 0.99007225036621))
+
+
+def _k_weight_power(freqs: np.ndarray) -> np.ndarray:
+    """|H(f)|^2 of the K-weighting filter, evaluated at physical frequencies (Hz)."""
+    z = np.exp(-2j * np.pi * np.minimum(freqs, 23999.0) / 48000.0)
+
+    def biquad(b, a):
+        return (b[0] + b[1] * z + b[2] * z * z) / (a[0] + a[1] * z + a[2] * z * z)
+
+    return np.abs(biquad(*_K_SHELF) * biquad(*_K_HPF)) ** 2
+
+
+def normalization_gain(pcm: np.ndarray, sr: int) -> float | None:
+    """Linear gain that brings 16-bit stereo `pcm` to NORM_TARGET_LUFS.
+
+    Integrated loudness per ITU-R BS.1770: K-weighted energy in 400 ms blocks
+    (computed in the frequency domain, which by Parseval equals filtering), an
+    absolute gate at -70 LUFS and a relative gate 10 LU under the result. The
+    gain is capped so the loudest sample can't clip."""
+    block = int(0.4 * sr)
+    nb = len(pcm) // block
+    if nb < 2:
+        return None
+    w = _k_weight_power(np.fft.rfftfreq(block, 1.0 / sr))
+    w[1:-1] *= 2.0                         # one-sided spectrum: interior bins count twice
+    w /= float(block) * block
+    energy = np.zeros(nb)
+    for start in range(0, nb, 48):          # chunks keep memory small
+        stop = min(nb, start + 48)
+        seg = pcm[start * block: stop * block].astype(np.float32) * (1.0 / 32768.0)
+        for ch in range(2):
+            spec = np.fft.rfft(seg[:, ch].reshape(stop - start, block), axis=1)
+            energy[start:stop] += (spec.real ** 2 + spec.imag ** 2) @ w
+    with np.errstate(divide="ignore"):
+        lufs = -0.691 + 10 * np.log10(energy)
+    gated = energy[lufs > -70]
+    if not len(gated):
+        return None
+    rel = -0.691 + 10 * np.log10(gated.mean()) - 10
+    kept = energy[lufs > max(-70.0, rel)]
+    loudness = -0.691 + 10 * np.log10(kept.mean())
+    gain_db = max(-NORM_MAX_CUT_DB, min(NORM_MAX_BOOST_DB, NORM_TARGET_LUFS - loudness))
+    peak = int(np.abs(pcm).max()) / 32768.0
+    if peak > 0:
+        gain_db = min(gain_db, 20 * math.log10(0.98 / peak))
+    return 10 ** (gain_db / 20)
+
+
+SF_EXTS = {".flac", ".wav", ".aif", ".aiff", ".ogg", ".oga", ".opus", ".mp3"}   # decoded by libsndfile
+SINC_HALF = 8   # resampler taps on each side of the read point (more when downsampling)
+
+
+class _Decimator:
+    """Streams high-rate audio (88.2 to 384 kHz) down by an integer factor while it
+    decodes: a long windowed-sinc low-pass, evaluated only at the kept samples, so
+    ultrasonic content is removed instead of folding into the audible range."""
+
+    def __init__(self, factor: int):
+        self.m = factor
+        n = 32 * factor + 1
+        fc = 0.5 / factor * 0.9                    # just under the new Nyquist
+        x = np.arange(n) - (n - 1) / 2
+        h = 2 * fc * np.sinc(2 * fc * x) * np.blackman(n)
+        self.h = (h / h.sum()).astype(np.float32)
+        self.state = np.zeros((n - 1, 2), np.float32)
+        self.t = 0                                 # input samples consumed so far
+
+    def __call__(self, block: np.ndarray) -> np.ndarray:
+        ext = np.concatenate([self.state, block.astype(np.float32)])
+        first = (-self.t) % self.m                 # keep every m-th input sample, in phase across blocks
+        out = np.empty(((len(block) - first + self.m - 1) // self.m, 2), np.float32)
+        for c in range(2):
+            win = np.lib.stride_tricks.sliding_window_view(ext[:, c], len(self.h))[first::self.m]
+            out[:, c] = win @ self.h[::-1]
+        self.state = ext[-(len(self.h) - 1):]
+        self.t += len(block)
+        return np.clip(np.rint(out), -32768, 32767).astype(np.int16)
+
+
+def decimation_factor(rate: int) -> int:
+    """How far to bring a hi-res rate down while staying at 44.1 kHz or more."""
+    m = 1
+    while rate % (m * 2) == 0 and rate // (m * 2) >= 44100:
+        m *= 2
+    return m
+
+
 class DecodeJob(QObject):
-    """Decodes one file to 16-bit stereo on a worker thread. Decoding produces
-    thousands of small buffers; on the GUI thread they would starve the audio pump.
-    The engine reads `n` and then `buf`: `buf` is replaced before `n` grows, so a
-    reader always sees at least `n` valid frames."""
+    """Decodes one file to 16-bit stereo PCM on a worker thread, at the file's own
+    sample rate (`rate`); the engine resamples on output. libsndfile reads the
+    common formats in large blocks (Qt's decoder delivers FLAC in ~70-sample
+    pieces, too slow for hi-res files); Qt's decoder covers the rest (M4A, WMA,
+    video), converted to `fallback_fmt`. The engine reads `n` and then `buf`:
+    `buf` is replaced before `n` grows, so a reader always sees `n` valid frames."""
 
     done = Signal()
     failed = Signal(str)
 
-    def __init__(self, path: str, fmt: QAudioFormat, expect_ms: int):
+    def __init__(self, path: str, fallback_fmt: QAudioFormat, expect_ms: int):
         super().__init__()
-        self.path, self.fmt = path, fmt
-        frames = int(fmt.sampleRate() * (expect_ms / 1000 + 2)) if expect_ms else fmt.sampleRate() * 240
-        self.buf = np.zeros((max(frames, fmt.sampleRate()), 2), np.int16)
+        self.path, self.fallback_fmt, self.expect_ms = path, fallback_fmt, expect_ms
+        self.rate = fallback_fmt.sampleRate()
+        self.buf = np.zeros((0, 2), np.int16)
         self.n = 0
         self.complete = False
         self.cancelled = False
+        self.gain: float | None = None   # loudness normalization; first estimate, then exact
         self._decoder = None
 
+    def _reserve(self, frames: int):
+        self.buf = np.zeros((max(int(frames), self.rate), 2), np.int16)
+
+    def _append(self, a: np.ndarray):
+        need = self.n + len(a)
+        buf = self.buf
+        if need > len(buf):
+            grown = np.zeros((max(need, len(buf) * 2), 2), np.int16)
+            grown[: self.n] = buf[: self.n]
+            buf = grown
+        buf[self.n: need] = a
+        self.buf = buf
+        self.n = need
+        if self.gain is None and need >= self.rate * 15:
+            self.gain = normalization_gain(buf[:need], self.rate)   # early estimate
+
     def run(self):
+        if Path(self.path).suffix.lower() in SF_EXTS:
+            try:
+                self._run_soundfile()
+                return
+            except Exception:
+                if self.cancelled:
+                    self.thread().quit()
+                    return
+                self.n = 0   # libsndfile couldn't read it: let Qt try
+        self._run_qt()
+
+    def _run_soundfile(self):
+        import soundfile as sf
+        with sf.SoundFile(self.path) as f:
+            factor = decimation_factor(f.samplerate)
+            decimate = _Decimator(factor) if factor > 1 else None
+            self.rate = f.samplerate // factor
+            self._reserve((f.frames + 16) // factor if f.frames > 0 else self.rate * 240)
+            for block in f.blocks(blocksize=1 << 16, dtype="int16", always_2d=True):
+                if self.cancelled:
+                    self.thread().quit()
+                    return
+                if block.shape[1] == 1:
+                    block = np.repeat(block, 2, axis=1)
+                elif block.shape[1] > 2:
+                    block = block[:, :2]
+                self._append(decimate(block) if decimate else block)
+        self._finish()
+
+    def _run_qt(self):
+        self.rate = self.fallback_fmt.sampleRate()
+        self._reserve(self.rate * (self.expect_ms / 1000 + 2) if self.expect_ms else self.rate * 240)
         d = QAudioDecoder(self)
-        d.setAudioFormat(self.fmt)
+        d.setAudioFormat(self.fallback_fmt)
         d.setSource(QUrl.fromLocalFile(self.path))
         d.bufferReady.connect(self._on_buffer)
-        d.finished.connect(self._on_finished)
+        d.finished.connect(self._finish)
         d.error.connect(lambda _e: self._fail(d.errorString()))
         self._decoder = d
         d.start()
@@ -710,18 +862,15 @@ class DecodeJob(QObject):
         if not b.isValid():
             return
         a = np.frombuffer(bytes(b.constData()), np.int16)
-        a = a[: len(a) - len(a) % 2].reshape(-1, 2)
-        need = self.n + len(a)
-        buf = self.buf
-        if need > len(buf):
-            grown = np.zeros((max(need, len(buf) * 2), 2), np.int16)
-            grown[: self.n] = buf[: self.n]
-            buf = grown
-        buf[self.n: need] = a
-        self.buf = buf
-        self.n = need
+        self._append(a[: len(a) - len(a) % 2].reshape(-1, 2))
 
-    def _on_finished(self):
+    def _finish(self):
+        try:
+            final = normalization_gain(self.buf[: self.n], self.rate)
+            if final is not None or self.gain is None:
+                self.gain = final if final is not None else 1.0
+        except Exception:
+            self.gain = self.gain or 1.0
         self.complete = True
         self.thread().quit()
         if not self.cancelled:
@@ -750,6 +899,8 @@ class AudioEngine(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.loop = True
+        self.normalize = True     # loudness normalization on/off
+        self._norm = 1.0          # gain currently applied; eases toward the track's
         self.rate_target = 0.0    # platter speed (1 = normal), ramped per sample
         self.vol_target = 0.0
         self._rate = 0.0
@@ -806,13 +957,10 @@ class AudioEngine(QObject):
             self._wake()
 
     def _resample_to(self, rate: int):
-        """Rare: the new device can't take our rate. Re-decode at its rate, same spot."""
-        pos_s = self._pos / self.sr
+        """The new device wants another rate: output at it. Decoded audio stays at its
+        own rate (the resampler adapts), so playback continues from the same spot."""
         self.sr = rate
         self.fmt = engine_format(rate)
-        if self._job is not None:
-            self.load(self._job.path, int(self._job.n / max(1, self._job.fmt.sampleRate()) * 1000))
-        self._pos = pos_s * self.sr
 
     def _wake(self):
         if self._io is None:
@@ -858,14 +1006,15 @@ class AudioEngine(QObject):
 
     # --- clock
     def position_ms(self) -> int:
-        return int(self._pos / self.sr * 1000) if self._job is not None and self._job.n else 0
+        job = self._job
+        return int(self._pos / job.rate * 1000) if job is not None and job.n else 0
 
     def duration_ms(self) -> int:
         job = self._job
         if job is None:
             return 0
         if job.complete:
-            return int(job.n / self.sr * 1000)
+            return int(job.n / job.rate * 1000)
         return 0
 
     # --- rendering
@@ -882,8 +1031,10 @@ class AudioEngine(QObject):
         complete = job.complete
         if n < 2:
             return silence
-        steps = np.concatenate(([0.0], np.cumsum(rates[:-1])))
-        end = self._pos + float(rates.sum())
+        ratio = job.rate / self.sr                 # source frames per output frame at normal speed
+        src = rates * ratio
+        steps = np.concatenate(([0.0], np.cumsum(src[:-1])))
+        end = self._pos + float(src.sum())
         looping = self.loop and complete
         if not looping and end >= n - 1:
             if not complete:
@@ -898,14 +1049,26 @@ class AudioEngine(QObject):
         else:
             idx = np.minimum(idx, n - 1.0001)
             end = min(end, n - 1.0001)
-        i0 = idx.astype(np.int64)
-        frac = (idx - i0).astype(np.float32)[:, None]
-        i1 = i0 + 1
-        if looping:
-            i1 %= n
-        a = data[i0].astype(np.float32)
-        b = data[i1].astype(np.float32)
-        out = (a + (b - a) * frac) * vols[:, None]
+        # windowed-sinc resampling: when the source runs faster than the output the
+        # kernel widens, so it also removes what the output rate can't carry
+        speed = ratio * max(self._rate, float(rates[0]), 1e-3)
+        scale = speed / 0.92 if speed > 1.0 else 1.0   # downsampling: cut a little under the output Nyquist
+        half = int(math.ceil(SINC_HALF * scale))
+        k = np.arange(-half + 1, half + 1)
+        i0 = np.floor(idx).astype(np.int64)
+        x = k[None, :] - (idx - i0)[:, None]
+        t = x / half
+        kern = np.sinc(x / scale) * (0.42 + 0.5 * np.cos(np.pi * t) + 0.08 * np.cos(2 * np.pi * t))
+        kern /= kern.sum(axis=1, keepdims=True)
+        taps = i0[:, None] + k[None, :]
+        taps = taps % n if looping else np.clip(taps, 0, n - 1)
+        sampled = np.einsum("ft,ftc->fc", kern.astype(np.float32), data[taps].astype(np.float32))
+        # loudness normalization eases toward the track's gain (estimate, then exact)
+        want = job.gain if self.normalize and job.gain is not None else (self._norm if self.normalize else 1.0)
+        nxt = want + (self._norm - want) * math.exp(-frames / self.sr / 0.4)
+        norm = np.linspace(self._norm, nxt, frames, endpoint=False, dtype=np.float32)
+        self._norm = nxt
+        out = sampled * (vols * norm)[:, None]
         self._pos = end
         return out
 
@@ -982,6 +1145,7 @@ class Player(QObject):
         self.want_playing = False
         self.auto_paused = False
         self.style = "glassy"
+        self.hires = False
         self.volume = 1.0        # user volume (Ctrl + scroll), on top of fades and the platter
         self._pending: str | None = None
         self._disc_cache: dict[int, QPixmap] = {}
@@ -1158,6 +1322,7 @@ class Player(QObject):
         self.path = path
         self.title = info.title
         self.length_ms = info.length_ms
+        self.hires = info.hires
         self.art = info.art
         self.seed = zlib.crc32(path.lower().encode("utf-8"))
         self.accent = accent_from(info.art, self.seed)
@@ -2022,6 +2187,15 @@ class DiscCard(QWidget):
         self._glide_at = QPointF()
         self._glide_t = 0.0
         self._grab_offset = QPointF()
+        self.bouncy = False                # pop-out keeps the release momentum and bounces off screen edges
+        self._drag_trail: list[tuple[float, QPointF]] = []
+        self._throw = QTimer(self)
+        self._throw.setTimerType(Qt.PreciseTimer)
+        self._throw.setInterval(7)
+        self._throw.timeout.connect(self._throw_step)
+        self._throw_at = QPointF()
+        self._throw_v = QPointF()
+        self._throw_t = 0.0
         self._body_key = None
         self._body_img: QImage | None = None
         self._decor_key = None
@@ -2383,6 +2557,47 @@ class DiscCard(QWidget):
         super().moveEvent(e)
 
     GLIDE_TAU = 0.022   # seconds; how softly the pop-out follows the cursor
+    THROW_FRICTION = 1.15   # per second: how quickly a thrown pop-out slows down
+    THROW_BOUNCE = 0.72     # share of speed kept when it bounces off a screen edge
+
+    def _release_velocity(self) -> QPointF:
+        """Cursor speed over the last ~100 ms of the drag (px/s); zero if it was held still."""
+        now = time.perf_counter()
+        trail = [s for s in self._drag_trail if now - s[0] < 0.12]
+        if len(trail) < 2 or now - trail[-1][0] > 0.08:
+            return QPointF()
+        (t0, p0), (t1, p1) = trail[0], trail[-1]
+        if t1 - t0 < 0.01:
+            return QPointF()
+        v = (p1 - p0) / (t1 - t0)
+        speed = math.hypot(v.x(), v.y())
+        return v * (6000 / speed) if speed > 6000 else v
+
+    def _throw_step(self):
+        now = time.perf_counter()
+        dt = min(0.03, now - self._throw_t)
+        self._throw_t = now
+        self._throw_at += self._throw_v * dt
+        self._throw_v *= math.exp(-self.THROW_FRICTION * dt)
+        screen = QGuiApplication.screenAt(self.frameGeometry().center()) or self.screen()
+        area = screen.availableGeometry()
+        left, top = float(area.left()), float(area.top())
+        right, bottom = float(area.right() - self.width() + 1), float(area.bottom() - self.height() + 1)
+        x, y = self._throw_at.x(), self._throw_at.y()
+        vx, vy = self._throw_v.x(), self._throw_v.y()
+        if x < left:
+            x, vx = left + (left - x), abs(vx) * self.THROW_BOUNCE
+        elif x > right:
+            x, vx = right - (x - right), -abs(vx) * self.THROW_BOUNCE
+        if y < top:
+            y, vy = top + (top - y), abs(vy) * self.THROW_BOUNCE
+        elif y > bottom:
+            y, vy = bottom - (y - bottom), -abs(vy) * self.THROW_BOUNCE
+        self._throw_at, self._throw_v = QPointF(x, y), QPointF(vx, vy)
+        self.move(self._throw_at.toPoint())
+        if math.hypot(vx, vy) < 25:
+            self._throw.stop()
+            self.moved.emit(self.pos())
 
     def _glide_step(self):
         now = time.perf_counter()
@@ -2452,9 +2667,13 @@ class DiscCard(QWidget):
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
+            if self._throw.isActive():   # catch it mid-flight
+                self._throw.stop()
+                self.moved.emit(self.pos())
             self._press = e.globalPosition().toPoint()
             self._grab_offset = e.globalPosition() - QPointF(self.pos())
             self._dragged = False
+            self._drag_trail = [(time.perf_counter(), e.globalPosition())]
 
     def mouseMoveEvent(self, e):
         pos = e.position()
@@ -2467,6 +2686,9 @@ class DiscCard(QWidget):
             delta = e.globalPosition().toPoint() - self._press
             if self._dragged or delta.manhattanLength() > 4:
                 self._dragged = True
+                now = time.perf_counter()
+                self._drag_trail.append((now, e.globalPosition()))
+                self._drag_trail = [s for s in self._drag_trail if now - s[0] < 0.12]
                 self._glide_to = e.globalPosition() - self._grab_offset
                 if not self._glide.isActive():
                     self._glide_at = QPointF(self.pos())
@@ -2479,7 +2701,14 @@ class DiscCard(QWidget):
         self._press = None
         if self._dragged:
             self._glide_to = e.globalPosition() - self._grab_offset
-            return   # the glide settles on the target, then reports the new position
+            v = self._release_velocity()
+            if self.bouncy and math.hypot(v.x(), v.y()) > 220:
+                self._glide.stop()
+                self._throw_at = QPointF(self.pos())
+                self._throw_v = v
+                self._throw_t = time.perf_counter()
+                self._throw.start()
+            return   # otherwise the glide settles on the target, then reports the new position
         if self._in_btn(e.position()):
             self.popToggle.emit()
         elif self._in_disc(e.position()):
@@ -2810,8 +3039,10 @@ class DiscCard(QWidget):
     def _text(self) -> QImage:
         """Title and time; re-rendered only when the words change (about once a second)."""
         pl = self.player
-        title_rect = QRectF(16, self.PAD + self.D + 38, self.W - 32, 22)
-        time_rect = QRectF(16, title_rect.bottom() + 1, self.W - 32, 18)
+        hires = pl.hires and pl.path and not self._drop_hover and not pl.error
+        title_rect = QRectF(16, self.PAD + self.D + (33 if hires else 38), self.W - 32, 22)
+        hires_rect = QRectF(16, title_rect.bottom() - 3, self.W - 32, 12)
+        time_rect = QRectF(16, (hires_rect.bottom() if hires else title_rect.bottom()) + 1, self.W - 32, 18)
         tf = ui_font(10.5, QFont.DemiBold)
         if self._drop_hover:
             title = "Drop to play" if self._drop_hover == 1 else f"Drop to play {self._drop_hover} tracks"
@@ -2824,12 +3055,18 @@ class DiscCard(QWidget):
         else:
             t = "drag files onto the tray icon"
         aero = pl.style == "aero"
-        key = (title, t, pl.style, self.devicePixelRatioF())
+        key = (title, t, pl.style, bool(hires), self.devicePixelRatioF())
         if key == self._text_key and self._text_img is not None:
             return self._text_img
         img = self._layer()
         p = QPainter(img)
         p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
+        if hires:   # small, grey and see-through, under the title
+            hf = ui_font(7.5, QFont.DemiBold)
+            hf.setLetterSpacing(QFont.AbsoluteSpacing, 0.8)
+            p.setFont(hf)
+            p.setPen(QColor(235, 235, 240, 110))
+            p.drawText(hires_rect, Qt.AlignCenter, "Hi-Res")
         p.setFont(tf)
         title = QFontMetrics(tf).elidedText(title, Qt.ElideRight, int(title_rect.width()))
         if pl.style == "snow":
@@ -3168,7 +3405,19 @@ class DiscTrayApp(QObject):
             act.setChecked(key == self.player.style)
             group.addAction(act)
         self.refresh_hz = self.cfg.get("refresh_hz") if self.cfg.get("refresh_hz") in REFRESH_RATES else 60
-        rate_menu = self.menu.addMenu("Glass refresh rate")
+        settings = self.menu.addMenu("Settings")
+        self.act_norm = QAction("Volume normalization", settings, checkable=True)
+        self.act_norm.setChecked(self.cfg.get("normalize", True))
+        self.act_norm.toggled.connect(self.set_normalize)
+        settings.addAction(self.act_norm)
+        self.act_bouncy = QAction("Bouncy pop-out (throw it around)", settings, checkable=True)
+        self.act_bouncy.setChecked(self.cfg.get("bouncy", True))
+        self.act_bouncy.toggled.connect(self.set_bouncy)
+        settings.addAction(self.act_bouncy)
+        self.player.engine.normalize = self.act_norm.isChecked()
+        self.pop.bouncy = self.act_bouncy.isChecked()
+        settings.addSeparator()
+        rate_menu = settings.addMenu("Glass refresh rate")
         rates = QActionGroup(rate_menu)
         for hz in REFRESH_RATES:
             act = rate_menu.addAction(f"{hz} fps", lambda h=hz: self.set_refresh_rate(h))
@@ -3183,11 +3432,11 @@ class DiscTrayApp(QObject):
         rate_menu.addAction(self.act_boost)
         for card in (self.panel, self.pop, self.hud):
             card.backdrop.set_rate(self.refresh_hz, self.refresh_boost)
-        self.menu.addSeparator()
-        self.act_startup = QAction("Start with Windows", self.menu, checkable=True)
+        self.act_startup = QAction("Start with Windows", settings, checkable=True)
         self.act_startup.setChecked(startup_enabled())
         self.act_startup.toggled.connect(self._toggle_startup)
-        self.menu.addAction(self.act_startup)
+        settings.addAction(self.act_startup)
+        self.menu.addSeparator()
         if updater_path().is_file():   # only in installed builds
             self.menu.addAction("Check for updates…", self.check_updates)
         about = self.menu.addAction(f"{APP_NAME} {__version__}")
@@ -3474,6 +3723,16 @@ class DiscTrayApp(QObject):
         self.cfg["style"] = key
         save_config(self.cfg)
         self.player.changed.emit()
+
+    def set_normalize(self, on: bool):
+        self.player.engine.normalize = on
+        self.cfg["normalize"] = on
+        save_config(self.cfg)
+
+    def set_bouncy(self, on: bool):
+        self.pop.bouncy = on
+        self.cfg["bouncy"] = on
+        save_config(self.cfg)
 
     def check_updates(self):
         import subprocess
