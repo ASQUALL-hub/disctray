@@ -33,7 +33,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.5.2"
+__version__ = "1.6.0"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
@@ -1160,7 +1160,9 @@ class Player(QObject):
         self.engine.ended.connect(self._on_ended)
 
         self.queue: list[str] = []   # one file loops forever; several play in turn, looping the list
-        self.index = 0
+        self.order: list[int] = []   # play order (queue indices): in turn, or a fresh shuffle every pass
+        self.index = 0               # position in self.order
+        self.shuffle = False
         self._err_streak = 0
         self.path: str | None = None
         self.title = "Drop an audio file here"
@@ -1302,20 +1304,77 @@ class Player(QObject):
     def _finish_pause(self):
         pass   # the platter is at 0: the engine outputs silence and lets the device sleep
 
-    def load_list(self, paths: list[str], index: int = 0, animate: bool = True):
-        """Replace whatever is playing with these files (a single file just loops)."""
+    def load_list(self, paths: list[str], index: int | None = None, animate: bool = True,
+                  order: list[int] | None = None, pos: int = 0):
+        """Replace whatever is playing with these files (a single file just loops).
+        `index` picks the file to start with (default: the first, or a random one
+        when shuffling); `order` and `pos` restore a saved shuffle."""
         if not paths:
             return
         self.queue = [str(Path(p)) for p in paths]
-        self.index = index % len(self.queue)
+        n = len(self.queue)
+        if order is not None and sorted(order) == list(range(n)):
+            self.order, self.index = list(order), pos % n
+        elif self.shuffle:
+            self.order = self._shuffled(first=None if index is None else index % n)
+            self.index = 0
+        else:
+            self.order = list(range(n))
+            self.index = (index or 0) % n
         self._err_streak = 0
-        self.load(self.queue[self.index], animate)
+        self.load(self.queue[self.order[self.index]], animate)
+
+    def track_index(self) -> int:
+        """Index in self.queue of the current file."""
+        return self.order[self.index] if self.order else 0
+
+    def _shuffled(self, first: int | None = None, avoid: int | None = None) -> list[int]:
+        """Every file once, in random order. `first` starts the pass; `avoid` keeps
+        the song that just ended from coming straight back when a new pass begins."""
+        rest = [i for i in range(len(self.queue)) if i != first]
+        random.shuffle(rest)
+        if avoid is not None and len(rest) > 1 and rest[0] == avoid:
+            j = random.randrange(1, len(rest))
+            rest[0], rest[j] = rest[j], rest[0]
+        return ([first] if first is not None else []) + rest
+
+    def set_shuffle(self, on: bool):
+        if on == self.shuffle:
+            return
+        self.shuffle = on
+        if self.queue:
+            cur = self.track_index()
+            # the current song keeps playing; the rest of the pass follows the new order
+            self.order = self._shuffled(first=cur) if on else list(range(len(self.queue)))
+            self.index = 0 if on else cur
+        self.changed.emit()
 
     def next(self, animate: bool = True):
         if len(self.queue) < 2:
             return
-        self.index = (self.index + 1) % len(self.queue)
-        self.load(self.queue[self.index], animate)
+        if self.index + 1 >= len(self.order):   # a full pass: shuffle again for the next one
+            if self.shuffle:
+                self.order = self._shuffled(avoid=self.track_index())
+            self.index = 0
+        else:
+            self.index += 1
+        self.load(self.queue[self.order[self.index]], animate)
+
+    def previous(self, animate: bool = True):
+        if len(self.queue) < 2:
+            return
+        self.index = (self.index - 1) % len(self.order)
+        self.load(self.queue[self.order[self.index]], animate)
+
+    def skip(self, step: int):
+        """Ctrl + click: a song forward or back; a single song starts over."""
+        if not self.path:
+            return
+        if len(self.queue) < 2:
+            self.engine.seek(0)
+            self.play()
+            return
+        (self.next if step > 0 else self.previous)()
 
     def _on_position(self, pos):
         # start easing out just before the end so tracks blend into each other
@@ -2489,10 +2548,12 @@ class DiscCard(QWidget):
     W, H = 252, 318
     PAD, D = 22, 196
     BTN_R = 12
+    BTN_GAP = 32     # centre to centre: pop-out and shuffle side by side under the record
     RADIUS = 10      # Frutiger Aero corners
     CORNER = 44      # Glassy squircle corner extent
 
     popToggle = Signal()
+    shuffleToggle = Signal()
     volumeWheel = Signal(float)
     fileDropped = Signal(list)
     deactivated = Signal()
@@ -2509,6 +2570,7 @@ class DiscCard(QWidget):
         self._appear = 1.0
         self._hover_disc = False
         self._hover_btn = False
+        self._hover_shuf = False
         self._drop_hover = False
         self._press = None
         self._press_win = None
@@ -2607,7 +2669,23 @@ class DiscCard(QWidget):
     def btn_center(self) -> QPointF:
         if self.player.style == "turntable":
             return QPointF(229, 207)          # a knob on the deck
-        return QPointF(self.W / 2, self.PAD + self.D + 21)
+        return QPointF(self.W / 2 - self.BTN_GAP / 2, self.PAD + self.D + 21)
+
+    def shuffle_center(self) -> QPointF:
+        if self.player.style == "turntable":
+            return QPointF(207, 215)          # the smaller knob beside it
+        return QPointF(self.W / 2 + self.BTN_GAP / 2, self.PAD + self.D + 21)
+
+    def _button_at(self, pos) -> str | None:
+        """"pop", "shuffle" or None: whichever button is nearest, if the point is on one."""
+        best, best_d = None, 0.0
+        tt = self.player.style == "turntable"
+        for name, c, r in (("pop", self.btn_center(), self.BTN_R + 4),
+                           ("shuffle", self.shuffle_center(), 11 if tt else self.BTN_R + 4)):
+            d = math.hypot(QPointF(pos).x() - c.x(), QPointF(pos).y() - c.y())
+            if d <= r and (best is None or d < best_d):
+                best, best_d = name, d
+        return best
 
     def _disc_scale(self) -> float:
         return {"snow": SNOW_DISC_SCALE, "turntable": TT_SCALE}.get(self.player.style, 1.0)
@@ -2621,8 +2699,14 @@ class DiscCard(QWidget):
         return (d.x() / r) ** 2 + (d.y() / (r * self._disc_tilt())) ** 2 <= 1.0
 
     def _in_btn(self, pos) -> bool:
-        d = QPointF(pos) - self.btn_center()
-        return math.hypot(d.x(), d.y()) <= self.BTN_R + 4
+        return self._button_at(pos) == "pop"
+
+    def _in_shuffle(self, pos) -> bool:
+        return self._button_at(pos) == "shuffle"
+
+    def _buttons_key(self) -> tuple:
+        """Everything about the two buttons that changes how they're drawn."""
+        return (self._hover_btn, self._hover_shuf, self.player.shuffle, self.popout or self.popped)
 
     # --- show / hide with a short slide
     def slide_in(self, target: QPoint, activate: bool):
@@ -2758,8 +2842,7 @@ class DiscCard(QWidget):
     def _snow_front(self, vis: float) -> QImage:
         """The globe's glass, the red and gold base it stands on, button and badge."""
         pl = self.player
-        key = (self.devicePixelRatioF(), self._hover_btn, self.popout or self.popped, len(pl.queue), pl.index,
-               bool(self._drop_hover))
+        key = (self.devicePixelRatioF(), self._buttons_key(), len(pl.queue), pl.index, bool(self._drop_hover))
         if key == self._scene_front_key and self._scene_front is not None:
             return self._scene_front
         img = self._layer()
@@ -2856,11 +2939,12 @@ class DiscCard(QWidget):
             p.drawEllipse(QPointF(hx + dx, hy + dy), 2.4, 2.4)
 
         paint_glass_edge(p, self._card_shape(), rim=1.8 if self._drop_hover else 1.0)
-        bc = self.btn_center()
         r = self.BTN_R
-        paint_glass_chip(p, squircle_shape(QRectF(bc.x() - r, bc.y() - r, 2 * r, 2 * r), r, n=4.0),
-                         fill=46 if self._hover_btn else 24, rim=1.3 if self._hover_btn else 1.0)
-        self._paint_pop_glyph(p, bc, inward=self.popout or self.popped)
+        for bc, lit in ((self.btn_center(), self._hover_btn), (self.shuffle_center(), self._hover_shuf or pl.shuffle)):
+            paint_glass_chip(p, squircle_shape(QRectF(bc.x() - r, bc.y() - r, 2 * r, 2 * r), r, n=4.0),
+                             fill=46 if lit else 24, rim=1.3 if lit else 1.0)
+        self._paint_pop_glyph(p, self.btn_center(), inward=self.popout or self.popped)
+        self._paint_shuffle_glyph(p, self.shuffle_center(), pl.shuffle)
         if len(pl.queue) > 1:
             bf = ui_font(8, QFont.DemiBold)
             label = f"{pl.index + 1} / {len(pl.queue)}"
@@ -3030,7 +3114,7 @@ class DiscCard(QWidget):
         self.ghosted = on
         set_click_through(int(self.winId()), on)
         if on:
-            self._hover_disc = self._hover_btn = False
+            self._hover_disc = self._hover_btn = self._hover_shuf = False
             self._press = None
         self._ghost_anim.stop()
         if on:
@@ -3074,8 +3158,9 @@ class DiscCard(QWidget):
         if e.button() == Qt.LeftButton and e.modifiers() & Qt.ControlModifier \
                 and self._in_disc(e.position()) and self.player.path:
             # Ctrl + grab the record: drag right to skip ahead, left to go back
+            # (a Ctrl + click that doesn't move goes back a song instead)
             self._scrub = {"x": e.globalPosition().x(), "ms": float(self.player.position()),
-                           "angle": self.player.angle}
+                           "angle": self.player.angle, "live": False}
             self.player.begin_scrub()
             self.setCursor(Qt.ClosedHandCursor)
             self.update()
@@ -3092,18 +3177,22 @@ class DiscCard(QWidget):
     def mouseMoveEvent(self, e):
         if self._scrub is not None:
             dx = e.globalPosition().x() - self._scrub["x"]
+            if not self._scrub["live"] and abs(dx) <= 3:
+                return   # still a click, not a drag
+            self._scrub["live"] = True
             dur = self.player.duration()
             self.player.scrub_to(self._scrub["ms"] + dx * dur / self.SCRUB_PX_PER_SONG)
             self.player.angle = (self._scrub["angle"] + dx * 1.4) % 360   # the record turns under your hand
             self.update()
             return
         pos = e.position()
-        hd, hb = self._in_disc(pos), self._in_btn(pos)
+        btn = self._button_at(pos)
+        hd, hb, hs = self._in_disc(pos), btn == "pop", btn == "shuffle"
         ctrl = bool(QGuiApplication.queryKeyboardModifiers() & Qt.ControlModifier)
-        if (hd, hb) != (self._hover_disc, self._hover_btn) or hd:
-            self._hover_disc, self._hover_btn = hd, hb
+        if (hd, hb, hs) != (self._hover_disc, self._hover_btn, self._hover_shuf) or hd:
+            self._hover_disc, self._hover_btn, self._hover_shuf = hd, hb, hs
             self.setCursor(Qt.OpenHandCursor if hd and ctrl and self.player.path
-                           else Qt.PointingHandCursor if hd or hb else Qt.ArrowCursor)
+                           else Qt.PointingHandCursor if hd or hb or hs else Qt.ArrowCursor)
             self.update()
         if self.popout and self._press is not None and e.buttons() & Qt.LeftButton:
             delta = e.globalPosition().toPoint() - self._press
@@ -3120,10 +3209,16 @@ class DiscCard(QWidget):
 
     def mouseReleaseEvent(self, e):
         if self._scrub is not None and e.button() == Qt.LeftButton:
+            clicked = not self._scrub["live"]
             self._scrub = None
             self.player.end_scrub()
             self.setCursor(Qt.PointingHandCursor)
             self.update()
+            if clicked:
+                self.player.skip(-1)
+            return
+        if e.button() == Qt.RightButton and e.modifiers() & Qt.ControlModifier:
+            self.player.skip(+1)   # Ctrl + right click: next song
             return
         if e.button() != Qt.LeftButton or self._press is None:
             return
@@ -3138,13 +3233,18 @@ class DiscCard(QWidget):
                 self._throw_t = time.perf_counter()
                 self._throw.start()
             return   # otherwise the glide settles on the target, then reports the new position
-        if self._in_btn(e.position()):
+        btn = self._button_at(e.position())
+        if e.modifiers() & Qt.ControlModifier:
+            self.player.skip(-1)   # Ctrl + click: previous song
+        elif btn == "pop":
             self.popToggle.emit()
+        elif btn == "shuffle":
+            self.shuffleToggle.emit()
         elif self._in_disc(e.position()):
             self.player.toggle()
 
     def leaveEvent(self, e):
-        self._hover_disc = self._hover_btn = False
+        self._hover_disc = self._hover_btn = self._hover_shuf = False
         self.update()
 
     def dragEnterEvent(self, e):
@@ -3439,7 +3539,7 @@ class DiscCard(QWidget):
         power light, and the speaker grille in front."""
         pl = self.player
         dpr = self.devicePixelRatioF()
-        key = (dpr, self._hover_btn, self.popout or self.popped, len(pl.queue), pl.index,
+        key = (dpr, self._buttons_key(), len(pl.queue), pl.index,
                bool(pl.want_playing and pl.path), bool(self._drop_hover))
         if key == self._tt_key and self._tt_img is not None:
             return self._tt_img
@@ -3543,14 +3643,14 @@ class DiscCard(QWidget):
         p.setBrush(Qt.NoBrush)
         p.drawEllipse(pv, 15, 15 * 0.6)
 
-        # knobs (the front one is the pop-out button) and the power light
-        bc = self.btn_center()
-        for kc, kr in ((QPointF(207, 214), 6.5), (bc, 9.5)):
+        # knobs (shuffle, and the front one is the pop-out button) and the power light
+        bc, sc = self.btn_center(), self.shuffle_center()
+        for kc, kr in ((sc, 7.5), (bc, 9.5)):
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(0, 0, 0, 120))
             p.drawEllipse(kc + QPointF(1, 2), kr, kr)
             knob = QRadialGradient(kc + QPointF(-kr * 0.3, -kr * 0.4), kr * 1.4)
-            hot = kc == bc and self._hover_btn
+            hot = self._hover_btn if kc == bc else self._hover_shuf
             knob.setColorAt(0.0, QColor(110, 110, 118) if hot else QColor(80, 80, 88))
             knob.setColorAt(1.0, QColor(18, 18, 22))
             p.setBrush(knob)
@@ -3559,6 +3659,7 @@ class DiscCard(QWidget):
             p.setBrush(Qt.NoBrush)
             p.drawEllipse(kc, kr - 0.5, kr - 0.5)
         self._paint_pop_glyph(p, bc, inward=self.popout or self.popped)
+        self._paint_shuffle_glyph(p, sc - QPointF(0, 1.2), pl.shuffle, scale=0.62)
         on = bool(pl.want_playing and pl.path)
         led = QColor(90, 255, 120) if on else QColor(200, 40, 40)
         glow = QRadialGradient(QPointF(207, 199), 6)
@@ -3730,8 +3831,8 @@ class DiscCard(QWidget):
         """Edge, disc shadow, pop-out button and playlist badge: only change on
         hover, state or style."""
         pl = self.player
-        key = (round(vis, 3), bool(self._drop_hover), pl.style, self.devicePixelRatioF(), self._hover_btn,
-               self.popout or self.popped, len(pl.queue), pl.index)
+        key = (round(vis, 3), bool(self._drop_hover), pl.style, self.devicePixelRatioF(), self._buttons_key(),
+               len(pl.queue), pl.index)
         if key == self._decor_key and self._decor_img is not None:
             return self._decor_img
         img = self._layer()
@@ -3774,17 +3875,19 @@ class DiscCard(QWidget):
             p.setBrush(caustic)
             p.drawEllipse(c + QPointF(0, R * 0.95), R * 0.5, R * 0.22)
 
-        # pop-out button
-        bc = self.btn_center()
-        if aero:
-            paint_aero_orb(p, bc, self.BTN_R, self._hover_btn)
-        else:
-            r = self.BTN_R
-            glossy = pl.style == "glossy"
-            paint_glass_chip(p, squircle_shape(QRectF(bc.x() - r, bc.y() - r, 2 * r, 2 * r), r, n=4.0),
-                             fill=(48 if self._hover_btn else 26) if glossy else (40 if self._hover_btn else 16),
-                             rim=(1.9 if glossy else 1.3) if self._hover_btn else (1.6 if glossy else 1.0))
-        self._paint_pop_glyph(p, bc, inward=self.popout or self.popped)
+        # pop-out and shuffle buttons
+        for bc, hot in ((self.btn_center(), self._hover_btn), (self.shuffle_center(), self._hover_shuf)):
+            lit = hot or (bc == self.shuffle_center() and pl.shuffle)
+            if aero:
+                paint_aero_orb(p, bc, self.BTN_R, lit)
+            else:
+                r = self.BTN_R
+                glossy = pl.style == "glossy"
+                paint_glass_chip(p, squircle_shape(QRectF(bc.x() - r, bc.y() - r, 2 * r, 2 * r), r, n=4.0),
+                                 fill=(48 if lit else 26) if glossy else (40 if lit else 16),
+                                 rim=(1.9 if glossy else 1.3) if lit else (1.6 if glossy else 1.0))
+        self._paint_pop_glyph(p, self.btn_center(), inward=self.popout or self.popped)
+        self._paint_shuffle_glyph(p, self.shuffle_center(), pl.shuffle)
 
         # playlist position
         if len(pl.queue) > 1:
@@ -3970,6 +4073,29 @@ class DiscCard(QWidget):
             tri.lineTo(-u * 0.7, u)
             tri.closeSubpath()
             p.drawPath(tri)
+
+    def _paint_shuffle_glyph(self, p: QPainter, c: QPointF, on: bool, scale: float = 1.0):
+        """Two crossing arrows: bright with a dot under them when shuffle is on, dim when off."""
+        pen = QPen(QColor(255, 255, 255, 235 if on else 125), 1.4 if scale >= 1 else 1.1)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        s = scale
+        for y0 in (3.4, -3.4):   # one strand from bottom-left to top-right, the other the opposite way
+            path = QPainterPath(QPointF(c.x() - 5.5 * s, c.y() + y0 * s))
+            path.lineTo(c.x() - 2.6 * s, c.y() + y0 * s)
+            path.cubicTo(QPointF(c.x(), c.y() + y0 * s), QPointF(c.x(), c.y() - y0 * s),
+                         QPointF(c.x() + 2.6 * s, c.y() - y0 * s))
+            path.lineTo(c.x() + 5.6 * s, c.y() - y0 * s)
+            p.drawPath(path)
+            tip = QPointF(c.x() + 5.6 * s, c.y() - y0 * s)
+            p.drawLine(tip, tip + QPointF(-2.2 * s, -2.2 * s))
+            p.drawLine(tip, tip + QPointF(-2.2 * s, 2.2 * s))
+        if on:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 255, 235))
+            p.drawEllipse(QPointF(c.x(), c.y() + 8.4 * s), 1.2 * s, 1.2 * s)
 
     def _paint_pop_glyph(self, p: QPainter, c: QPointF, inward: bool):
         pen = QPen(QColor(255, 255, 255, 220), 1.4)
@@ -4230,8 +4356,10 @@ class DiscTrayApp(QObject):
 
         self.panel = DiscCard(self.player, popout=False)
         self.pop = DiscCard(self.player, popout=True)
+        self.player.shuffle = bool(self.cfg.get("shuffle", False))
         for card in (self.panel, self.pop):
             card.popToggle.connect(self.toggle_popout)
+            card.shuffleToggle.connect(lambda: self.act_shuffle.toggle())
             card.fileDropped.connect(self._on_drop)
         self.panel.deactivated.connect(self._panel_deactivated)
         self._position_timer = QTimer(self)
@@ -4267,6 +4395,7 @@ class DiscTrayApp(QObject):
         self.tray.activated.connect(self._on_tray)
         self.menu = QMenu()
         self.act_play = self.menu.addAction("Pause", self.player.toggle)
+        self.act_prev = self.menu.addAction("Previous track", self.player.previous)
         self.act_next = self.menu.addAction("Next track", self.player.next)
         self.menu.addAction("Open audio files…", self.open_file)
         self.act_pop = self.menu.addAction("Pop out", self.toggle_popout)
@@ -4280,6 +4409,10 @@ class DiscTrayApp(QObject):
             group.addAction(act)
         self.refresh_hz = self.cfg.get("refresh_hz") if self.cfg.get("refresh_hz") in REFRESH_RATES else 60
         settings = self.menu.addMenu("Settings")
+        self.act_shuffle = QAction("Shuffle", settings, checkable=True)
+        self.act_shuffle.setChecked(self.player.shuffle)
+        self.act_shuffle.toggled.connect(self.set_shuffle)
+        settings.addAction(self.act_shuffle)
         self.act_norm = QAction("Volume normalization", settings, checkable=True)
         self.act_norm.setChecked(self.cfg.get("normalize", True))
         self.act_norm.toggled.connect(self.set_normalize)
@@ -4361,7 +4494,10 @@ class DiscTrayApp(QObject):
         else:
             files = [f for f in self.cfg.get("files") or [self.cfg.get("file")] if f and Path(f).is_file()]
             if files:
-                self.player.load_list(files, index=min(self.cfg.get("index", 0), len(files) - 1), animate=False)
+                order = self.cfg.get("order") if self.player.shuffle and len(files) == len(self.cfg.get("files") or []) \
+                    else None
+                self.player.load_list(files, index=min(self.cfg.get("index", 0), len(files) - 1), animate=False,
+                                      order=order, pos=self.cfg.get("pos", 0))
                 if self.cfg.get("position_ms"):   # pick up where the song was when DiscTray closed
                     self.player.engine.seek(self.cfg["position_ms"])
         if self.cfg.get("popout"):
@@ -4389,9 +4525,11 @@ class DiscTrayApp(QObject):
         self.act_play.setText("Pause" if pl.want_playing else "Play")
         self.act_play.setEnabled(bool(pl.path))
         self.act_next.setVisible(len(pl.queue) > 1)
-        if pl.path and (self.cfg.get("files") != pl.queue or self.cfg.get("index") != pl.index):
+        self.act_prev.setVisible(len(pl.queue) > 1)
+        state = {"files": pl.queue, "index": pl.track_index(), "order": pl.order, "pos": pl.index}
+        if pl.path and any(self.cfg.get(k) != v for k, v in state.items()):
             self.cfg.pop("file", None)
-            self.cfg["files"], self.cfg["index"] = pl.queue, pl.index
+            self.cfg.update(state)
             save_config(self.cfg)
 
     def _panel_pos(self) -> QPoint:
@@ -4679,6 +4817,11 @@ class DiscTrayApp(QObject):
         self.cfg["style"] = key
         save_config(self.cfg)
         self.player.changed.emit()
+
+    def set_shuffle(self, on: bool):
+        self.player.set_shuffle(on)   # emits changed, which saves the new order
+        self.cfg["shuffle"] = on
+        save_config(self.cfg)
 
     def set_normalize(self, on: bool):
         self.player.engine.normalize = on
