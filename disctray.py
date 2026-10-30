@@ -33,7 +33,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
@@ -4413,6 +4413,10 @@ class DiscTrayApp(QObject):
         self.act_shuffle.setChecked(self.player.shuffle)
         self.act_shuffle.toggled.connect(self.set_shuffle)
         settings.addAction(self.act_shuffle)
+        self.act_fs_pause = QAction("Pause while a program is fullscreen", settings, checkable=True)
+        self.act_fs_pause.setChecked(self.cfg.get("pause_fullscreen", True))
+        self.act_fs_pause.toggled.connect(self.set_fullscreen_pause)
+        settings.addAction(self.act_fs_pause)
         self.act_norm = QAction("Volume normalization", settings, checkable=True)
         self.act_norm.setChecked(self.cfg.get("normalize", True))
         self.act_norm.toggled.connect(self.set_normalize)
@@ -4487,7 +4491,8 @@ class DiscTrayApp(QObject):
         self._fs_timer = QTimer(self)
         self._fs_timer.setInterval(350)
         self._fs_timer.timeout.connect(self._poll_fullscreen)
-        self._fs_timer.start()
+        if self.act_fs_pause.isChecked():
+            self._fs_timer.start()
 
         if initial:
             self.player.load_list(initial, animate=False)
@@ -4772,6 +4777,18 @@ class DiscTrayApp(QObject):
             self.player.pause(auto=True)
         elif not fs and self.player.auto_paused:
             self.player.play()
+
+    def set_fullscreen_pause(self, on: bool):
+        self._fs_state = self._fs_seen = False
+        self._fs_count = 0
+        if on:
+            self._fs_timer.start()
+        else:
+            self._fs_timer.stop()
+            if self.player.auto_paused:   # it was paused for a fullscreen program: carry on
+                self.player.play()
+        self.cfg["pause_fullscreen"] = on
+        save_config(self.cfg)
 
     # --- misc
     def set_refresh_rate(self, hz: int):
