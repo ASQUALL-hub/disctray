@@ -33,7 +33,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
@@ -2186,7 +2186,46 @@ def paint_speaker(p: QPainter, c: QPointF, level: float, color: QColor):
 
 
 STYLES = {"glassy": "Glassy", "glossy": "Glossy Glass", "aero": "Frutiger Aero",
-          "snow": "Snow Globe", "liquid": "Liquid"}
+          "snow": "Snow Globe", "liquid": "Liquid", "turntable": "Record Player"}
+OPAQUE_STYLES = {"turntable"}   # solid styles: no glass, so no background capture
+VOLUME_NOTCHES = 12             # Ctrl + scroll: wheel notches from silent to full (about one full turn)
+
+# Record Player: the record lies on the deck, seen at an angle (vertical squash),
+# and a tonearm pivoting at the back right plays it.
+TT_CENTER = QPointF(112, 168)
+TT_SCALE = 0.98                  # record size relative to the other styles
+TT_TILT = 0.42                   # how flat the deck looks (1 = seen from straight above)
+TT_PIVOT = (1.13, -0.42)         # tonearm pivot, in record radii from the spindle (deck plane)
+TT_ARM = 1.05                    # tonearm length, in record radii
+
+
+def leather_texture(w: int, h: int, dpr: float, seed: int = 5) -> QImage:
+    """A fine pebbled grain for the case covering (light and dark specks, softened)."""
+    pw, ph = round(w * dpr), round(h * dpr)
+    rng = np.random.default_rng(seed)
+    n = rng.normal(0, 1, (ph, pw)).astype(np.float32)
+    n = _box_blur(_box_blur(n[..., None], 1, 0), 1, 1)[..., 0]
+    n /= max(1e-6, float(np.abs(n).max()))
+    out = np.zeros((ph, pw, 4), np.uint8)
+    light = n > 0
+    a = (np.abs(n) * 20).astype(np.uint8)
+    out[..., 3] = a
+    out[light, 0:3] = (a[light, None] * np.array([1, 1, 1])).astype(np.uint8)   # premultiplied white
+    img = QImage(out.data, pw, ph, pw * 4, QImage.Format_ARGB32_Premultiplied).copy()
+    img.setDevicePixelRatio(dpr)
+    return img
+
+
+def tonearm_geometry(r_target: float):
+    """Tonearm angle (deck plane) that puts the stylus `r_target` (in record radii)
+    from the spindle: the stylus sits where a circle around the pivot with the arm's
+    length meets a circle around the spindle."""
+    px, py = TT_PIVOT
+    d = math.hypot(px, py)
+    cos_a = (d * d + TT_ARM * TT_ARM - r_target * r_target) / (2 * d * TT_ARM)
+    alpha = math.acos(max(-1.0, min(1.0, cos_a)))
+    return math.atan2(-py, -px) - alpha
+
 
 
 def paint_glossy_overlay(p: QPainter, shape, w: float, h: float, corner: float):
@@ -2493,6 +2532,11 @@ class DiscCard(QWidget):
         self._accel = (0.0, 0.0)
         self._flakes = flake_sprites()
         self._drop_sprites: dict = {}
+        self._tt_key = None
+        self._tt_img: QImage | None = None
+        self._leather: QImage | None = None
+        self._arm_t = 0.0           # 0 = tonearm on its rest, 1 = on the record
+        self._arm_clock = time.perf_counter()
         self._scene_key = None
         self._scene_back: QImage | None = None
         self._scene_front_key = None
@@ -2500,17 +2544,25 @@ class DiscCard(QWidget):
 
     # --- geometry
     def disc_center(self) -> QPointF:
+        if self.player.style == "turntable":
+            return QPointF(TT_CENTER)
         return QPointF(self.W / 2, self.PAD + self.D / 2)
 
     def btn_center(self) -> QPointF:
+        if self.player.style == "turntable":
+            return QPointF(229, 207)          # a knob on the deck
         return QPointF(self.W / 2, self.PAD + self.D + 21)
 
     def _disc_scale(self) -> float:
-        return SNOW_DISC_SCALE if self.player.style == "snow" else 1.0
+        return {"snow": SNOW_DISC_SCALE, "turntable": TT_SCALE}.get(self.player.style, 1.0)
+
+    def _disc_tilt(self) -> float:
+        return TT_TILT if self.player.style == "turntable" else 1.0
 
     def _in_disc(self, pos) -> bool:
         d = QPointF(pos) - self.disc_center()
-        return math.hypot(d.x(), d.y()) <= self.D / 2 * self._disc_scale()
+        r = self.D / 2 * self._disc_scale()
+        return (d.x() / r) ** 2 + (d.y() / (r * self._disc_tilt())) ** 2 <= 1.0
 
     def _in_btn(self, pos) -> bool:
         d = QPointF(pos) - self.btn_center()
@@ -2943,7 +2995,7 @@ class DiscCard(QWidget):
     def showEvent(self, e):
         QTimer.singleShot(0, self._wake_sim)
         self.player.add_viewer()
-        if self.glass:
+        if self.glass and self.player.style not in OPAQUE_STYLES:
             self.backdrop.start()
         super().showEvent(e)
 
@@ -3036,6 +3088,8 @@ class DiscCard(QWidget):
     def _card_shape(self):
         if self.player.style == "aero":
             return rounded_shape(QRectF(self.rect()), self.RADIUS)
+        if self.player.style == "turntable":
+            return rounded_shape(QRectF(self.rect()), 16)
         return squircle_shape(QRectF(self.rect()), self.CORNER)
 
     def _card_path(self) -> QPainterPath:
@@ -3203,6 +3257,15 @@ class DiscCard(QWidget):
         base_opacity = p.opacity()
 
         # everything that doesn't spin comes from cached layers
+        if pl.style == "turntable":
+            p.drawImage(0, 0, self._turntable_back())
+            self._paint_disc(p, base_opacity, vis)
+            p.setOpacity(base_opacity)
+            self._paint_tonearm(p)
+            p.setOpacity(base_opacity * vis)
+            p.drawImage(0, 0, self._text())
+            p.end()
+            return
         if pl.style == "liquid":
             # draw the dry scene first: the water refracts it
             scene = self._layer()
@@ -3243,7 +3306,7 @@ class DiscCard(QWidget):
         p.setOpacity(base_opacity * vis)
         p.translate(c)
         s = (0.84 + 0.16 * pl.vis) * self._disc_scale()
-        p.scale(s, s)
+        p.scale(s, s * self._disc_tilt())      # squashed when the record lies on a deck
         p.save()
         p.rotate(pl.angle)
         disc = pl.disc_pixmap(px)
@@ -3256,6 +3319,284 @@ class DiscCard(QWidget):
         if (self._hover_disc or not pl.want_playing) and pl.path:
             self._paint_hub_glyph(p, R * LENS_R, playing=pl.want_playing)
         p.restore()
+
+    def _turntable_back(self) -> QImage:
+        """The suitcase record player around the record: leatherette case, open lid
+        with a recessed panel, chrome latches, black deck with platter, knobs and
+        power light, and the speaker grille in front."""
+        pl = self.player
+        dpr = self.devicePixelRatioF()
+        key = (dpr, self._hover_btn, self.popout or self.popped, len(pl.queue), pl.index,
+               bool(pl.want_playing and pl.path), bool(self._drop_hover))
+        if key == self._tt_key and self._tt_img is not None:
+            return self._tt_img
+        if self._leather is None or self._leather.devicePixelRatio() != dpr:
+            self._leather = leather_texture(self.W, self.H, dpr)
+        W, H = float(self.W), float(self.H)
+        img = self._layer()
+        p = QPainter(img)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
+        case = self._card_path()
+
+        # case: burgundy leatherette with a lighter piping along the edge
+        body = QLinearGradient(0, 0, 0, H)
+        body.setColorAt(0.0, QColor(132, 36, 58))
+        body.setColorAt(0.5, QColor(112, 26, 46))
+        body.setColorAt(1.0, QColor(84, 18, 34))
+        p.fillPath(case, body)
+        p.save()
+        p.setClipPath(case)
+        p.drawImage(0, 0, self._leather)
+        p.restore()
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(255, 190, 200, 70), 1.2))
+        p.drawPath(_rounded(QRectF(1.5, 1.5, W - 3, H - 3), 15))
+        p.setPen(QPen(QColor(30, 0, 8, 160), 1.0))
+        p.drawPath(case)
+
+        # open lid: a recessed panel with a soft inner shadow
+        lid = _rounded(QRectF(14, 12, W - 28, 96), 6)
+        inner = QLinearGradient(0, 12, 0, 108)
+        inner.setColorAt(0.0, QColor(96, 20, 38))
+        inner.setColorAt(1.0, QColor(122, 30, 52))
+        p.fillPath(lid, inner)
+        p.save()
+        p.setClipPath(lid)
+        p.drawImage(0, 0, self._leather)
+        for width, a in ((10, 26), (5, 40), (2, 70)):
+            p.setPen(QPen(QColor(20, 0, 6, a), width))
+            p.drawPath(lid)
+        p.restore()
+        p.setPen(QPen(QColor(255, 200, 210, 45), 1.0))
+        p.drawLine(QPointF(20, 108.5), QPointF(W - 20, 108.5))
+
+        # hinge line and the chrome latches at the sides
+        p.setPen(QPen(QColor(25, 0, 8, 200), 2.0))
+        p.drawLine(QPointF(4, 116), QPointF(W - 4, 116))
+        for x in (3.0, W - 9.0):
+            latch = _rounded(QRectF(x, 98, 6, 22), 2)
+            chrome = QLinearGradient(x, 0, x + 6, 0)
+            chrome.setColorAt(0.0, QColor(150, 150, 158))
+            chrome.setColorAt(0.5, QColor(240, 240, 246))
+            chrome.setColorAt(1.0, QColor(120, 120, 128))
+            p.fillPath(latch, chrome)
+            p.setPen(QPen(QColor(60, 60, 66), 0.8))
+            p.drawPath(latch)
+            p.setBrush(QColor(90, 90, 98))
+            p.drawEllipse(QPointF(x + 3, 103), 1.2, 1.2)
+            p.setBrush(Qt.NoBrush)
+
+        # deck plate
+        deck = _rounded(QRectF(10, 119, W - 20, 104), 5)
+        plate = QLinearGradient(0, 119, 0, 223)
+        plate.setColorAt(0.0, QColor(34, 34, 38))
+        plate.setColorAt(1.0, QColor(16, 16, 19))
+        p.fillPath(deck, plate)
+        p.setPen(QPen(QColor(255, 255, 255, 22), 1.0))
+        p.drawPath(deck)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(70, 70, 76))
+        for sx, sy in ((16, 125), (W - 16, 125), (16, 217), (W - 16, 217)):
+            p.drawEllipse(QPointF(sx, sy), 1.3, 1.3)
+
+        # platter under the record, and the record's edge (it has thickness)
+        c = QPointF(TT_CENTER)
+        R = self.D / 2 * TT_SCALE
+        p.setBrush(QColor(0, 0, 0, 120))
+        p.drawEllipse(c + QPointF(3, 7), R * 1.03, R * 1.03 * TT_TILT)
+        rim = QLinearGradient(c.x() - R, 0, c.x() + R, 0)
+        rim.setColorAt(0.0, QColor(90, 90, 96))
+        rim.setColorAt(0.5, QColor(170, 170, 178))
+        rim.setColorAt(1.0, QColor(80, 80, 86))
+        p.setBrush(rim)
+        p.drawEllipse(c + QPointF(0, 4), R * 1.02, R * 1.02 * TT_TILT)
+        p.setBrush(QColor(10, 10, 12))
+        p.drawEllipse(c + QPointF(0, 2.2), R, R * TT_TILT)
+
+        # tonearm rest and the pivot's base plate (the arm itself moves; see _paint_tonearm)
+        rest = self._arm_point(1.18)
+        p.setBrush(QColor(20, 20, 22))
+        p.drawEllipse(rest + QPointF(0, 2), 4, 2)
+        p.setPen(QPen(QColor(120, 120, 128), 2.0))
+        p.drawLine(rest + QPointF(0, 1), rest + QPointF(0, -6))
+        p.setPen(Qt.NoPen)
+        pv = self._arm_point(None)
+        base = QRadialGradient(pv, 15)
+        base.setColorAt(0.0, QColor(70, 70, 76))
+        base.setColorAt(1.0, QColor(28, 28, 32))
+        p.setBrush(base)
+        p.drawEllipse(pv, 15, 15 * 0.6)
+        p.setPen(QPen(QColor(150, 150, 160, 120), 0.8))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(pv, 15, 15 * 0.6)
+
+        # knobs (the front one is the pop-out button) and the power light
+        bc = self.btn_center()
+        for kc, kr in ((QPointF(207, 214), 6.5), (bc, 9.5)):
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, 120))
+            p.drawEllipse(kc + QPointF(1, 2), kr, kr)
+            knob = QRadialGradient(kc + QPointF(-kr * 0.3, -kr * 0.4), kr * 1.4)
+            hot = kc == bc and self._hover_btn
+            knob.setColorAt(0.0, QColor(110, 110, 118) if hot else QColor(80, 80, 88))
+            knob.setColorAt(1.0, QColor(18, 18, 22))
+            p.setBrush(knob)
+            p.drawEllipse(kc, kr, kr)
+            p.setPen(QPen(QColor(200, 200, 210, 90), 0.8))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(kc, kr - 0.5, kr - 0.5)
+        self._paint_pop_glyph(p, bc, inward=self.popout or self.popped)
+        on = bool(pl.want_playing and pl.path)
+        led = QColor(90, 255, 120) if on else QColor(200, 40, 40)
+        glow = QRadialGradient(QPointF(207, 199), 6)
+        glow.setColorAt(0.0, QColor(led.red(), led.green(), led.blue(), 160 if on else 90))
+        glow.setColorAt(1.0, QColor(led.red(), led.green(), led.blue(), 0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(glow)
+        p.drawEllipse(QPointF(207, 199), 6, 6)
+        p.setBrush(led)
+        p.drawEllipse(QPointF(207, 199), 1.6, 1.6)
+
+        # front: speaker grille with a metal mesh and a small wordmark
+        grille = _rounded(QRectF(24, 236, W - 48, 66), 7)
+        p.fillPath(grille, QColor(14, 12, 14))
+        p.save()
+        p.setClipPath(grille)
+        mesh = QPen(QColor(205, 205, 212, 150), 1.0)
+        p.setPen(mesh)
+        x = 27.0
+        while x < W - 24:
+            p.drawLine(QPointF(x, 236), QPointF(x, 302))
+            x += 5.0
+        y = 239.0
+        while y < 302:
+            p.drawLine(QPointF(24, y), QPointF(W - 24, y))
+            y += 5.0
+        shade = QLinearGradient(0, 236, 0, 302)
+        shade.setColorAt(0.0, QColor(255, 255, 255, 30))
+        shade.setColorAt(0.5, QColor(0, 0, 0, 0))
+        shade.setColorAt(1.0, QColor(0, 0, 0, 90))
+        p.fillRect(QRectF(24, 236, W - 48, 66), shade)
+        p.restore()
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(40, 0, 10, 220), 1.6))
+        p.drawPath(grille)
+        p.setPen(QPen(QColor(255, 190, 200, 40), 1.0))
+        p.drawPath(_rounded(QRectF(22.5, 234.5, W - 45, 69), 8))
+        mark = ui_font(6.5, QFont.Bold)
+        mark.setLetterSpacing(QFont.AbsoluteSpacing, 2.2)
+        p.setFont(mark)
+        p.setPen(QColor(0, 0, 0, 200))
+        p.fillRect(QRectF(30, 287, 72, 10), QColor(14, 12, 14))
+        p.setPen(QColor(225, 225, 232))
+        p.drawText(QRectF(30, 287, 72, 10), Qt.AlignCenter, "DISCTRAY")
+
+        if len(pl.queue) > 1:   # playlist position, as a little brass tag on the lid
+            bf = ui_font(7.5, QFont.Bold)
+            label = f"{pl.index + 1} / {len(pl.queue)}"
+            bw = QFontMetrics(bf).horizontalAdvance(label) + 14
+            tag = QRectF(W - bw - 22, 20, bw, 16)
+            brass = QLinearGradient(tag.topLeft(), tag.bottomLeft())
+            brass.setColorAt(0.0, QColor(240, 214, 150))
+            brass.setColorAt(1.0, QColor(176, 136, 62))
+            p.setPen(QPen(QColor(90, 60, 20), 0.8))
+            p.setBrush(brass)
+            p.drawRoundedRect(tag, 4, 4)
+            p.setFont(bf)
+            p.setPen(QColor(60, 36, 10))
+            p.drawText(tag, Qt.AlignCenter, label)
+        if self._drop_hover:
+            p.fillPath(case, QColor(255, 255, 255, 30))
+        p.end()
+        self._tt_key, self._tt_img = key, img
+        return img
+
+    def _arm_point(self, r_target):
+        """Screen point of the tonearm pivot (r_target None) or of the stylus when it
+        sits r_target record radii from the spindle."""
+        R = self.D / 2 * TT_SCALE
+        px, py = TT_PIVOT
+        if r_target is None:
+            x, y = px, py
+        else:
+            phi = tonearm_geometry(r_target)
+            x, y = px + TT_ARM * math.cos(phi), py + TT_ARM * math.sin(phi)
+        return QPointF(TT_CENTER.x() + x * R, TT_CENTER.y() + y * R * TT_TILT)
+
+    def _paint_tonearm(self, p: QPainter):
+        """The arm swings onto the record when playing and creeps inward as the song
+        plays, like a stylus following the groove; on pause it lifts and goes back."""
+        pl = self.player
+        now = time.perf_counter()
+        dt = min(0.1, now - self._arm_clock)
+        self._arm_clock = now
+        target = 1.0 if (pl.want_playing and pl.path) else 0.0
+        self._arm_t += (target - self._arm_t) * (1 - math.exp(-dt / 0.28))
+        if abs(target - self._arm_t) > 0.002:
+            QTimer.singleShot(16, self.update)   # keep animating even when the record is still
+        dur = pl.duration()
+        progress = min(1.0, pl.position() / dur) if dur else 0.0
+        groove = 0.92 - 0.52 * progress                       # lead-in at the edge, run-out near the label
+        t = self._arm_t
+        r = 1.18 + (groove - 1.18) * t
+        lift = math.sin(math.pi * min(1.0, max(0.0, t))) * 7  # raised while swinging over
+        pivot = self._arm_point(None)
+        stylus = self._arm_point(r)
+        top = pivot + QPointF(0, -11)                         # the arm sits on a short post
+        tip = stylus + QPointF(0, -3 - lift)
+        d = tip - top
+        length = math.hypot(d.x(), d.y()) or 1.0
+        ux, uy = d.x() / length, d.y() / length
+        nx, ny = -uy, ux
+
+        # shadow on the deck / record
+        p.setPen(QPen(QColor(0, 0, 0, 90), 3.0, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(pivot + QPointF(3, 3), stylus + QPointF(3 + lift * 0.4, 3 + lift * 0.6))
+        # post and counterweight
+        p.setPen(QPen(QColor(110, 110, 118), 4.0, Qt.SolidLine, Qt.FlatCap))
+        p.drawLine(pivot, top)
+        back = top - QPointF(ux, uy) * 15
+        cw = QPainterPath()
+        cw.moveTo(back + QPointF(nx, ny) * 5)
+        cw.lineTo(back + QPointF(nx, ny) * 5 + QPointF(ux, uy) * 9)
+        cw.lineTo(back - QPointF(nx, ny) * 5 + QPointF(ux, uy) * 9)
+        cw.lineTo(back - QPointF(nx, ny) * 5)
+        cw.closeSubpath()
+        weight = QLinearGradient(back + QPointF(nx, ny) * 5, back - QPointF(nx, ny) * 5)
+        weight.setColorAt(0.0, QColor(90, 90, 98))
+        weight.setColorAt(0.5, QColor(40, 40, 46))
+        weight.setColorAt(1.0, QColor(16, 16, 20))
+        p.setPen(QPen(QColor(10, 10, 12), 0.8))
+        p.setBrush(weight)
+        p.drawPath(cw)
+        # the arm tube: silver with a highlight along it
+        p.setPen(QPen(QColor(120, 120, 130), 4.2, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(back + QPointF(ux, uy) * 6, tip - QPointF(ux, uy) * 8)
+        p.setPen(QPen(QColor(245, 245, 250), 1.4, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(back + QPointF(ux, uy) * 6 - QPointF(nx, ny) * 0.7, tip - QPointF(ux, uy) * 8 - QPointF(nx, ny) * 0.7)
+        # pivot cap
+        p.setPen(Qt.NoPen)
+        cap = QRadialGradient(top + QPointF(-1.5, -1.5), 6)
+        cap.setColorAt(0.0, QColor(200, 200, 210))
+        cap.setColorAt(1.0, QColor(40, 40, 46))
+        p.setBrush(cap)
+        p.drawEllipse(top, 5, 4)
+        # headshell with a red cartridge and a finger lift
+        hs = QPainterPath()
+        a0 = tip - QPointF(ux, uy) * 10
+        for k, (along, side) in enumerate(((0, 3.2), (12, 3.6), (12, -3.6), (0, -3.2))):
+            pt = a0 + QPointF(ux, uy) * along + QPointF(nx, ny) * side
+            hs.moveTo(pt) if k == 0 else hs.lineTo(pt)
+        hs.closeSubpath()
+        p.setPen(QPen(QColor(0, 0, 0), 0.8))
+        p.setBrush(QColor(28, 28, 32))
+        p.drawPath(hs)
+        cart = a0 + QPointF(ux, uy) * 6
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(210, 30, 40))
+        p.drawEllipse(cart, 2.6, 2.0)
+        p.setPen(QPen(QColor(150, 150, 160), 1.0, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(a0 + QPointF(nx, ny) * 3.4, a0 + QPointF(nx, ny) * 7 - QPointF(ux, uy) * 2)
 
     def _body(self, vis: float) -> QImage:
         """The glass itself (blurred backdrop, refraction, tint). Rebuilt when a new
@@ -3379,7 +3720,7 @@ class DiscCard(QWidget):
         img = self._layer()
         p = QPainter(img)
         p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
-        if hires:   # small, grey and see-through, under the title
+        if hires and pl.style != "turntable":   # small, grey and see-through, under the title
             hf = ui_font(7.5, QFont.DemiBold)
             hf.setLetterSpacing(QFont.AbsoluteSpacing, 0.8)
             p.setFont(hf)
@@ -3387,6 +3728,25 @@ class DiscCard(QWidget):
             p.drawText(hires_rect, Qt.AlignCenter, "Hi-Res")
         p.setFont(tf)
         title = QFontMetrics(tf).elidedText(title, Qt.ElideRight, int(title_rect.width()))
+        if pl.style == "turntable":   # the title on the lid, set like a maker's logo
+            lf = ui_font(11.5, QFont.Bold)
+            lf.setLetterSpacing(QFont.AbsoluteSpacing, 2.4)
+            lf.setCapitalization(QFont.AllUppercase)
+            lid = QRectF(24, 38, self.W - 48, 24)
+            p.setFont(lf)
+            shadow_text(p, lid, Qt.AlignCenter, QFontMetrics(lf).elidedText(title, Qt.ElideRight, int(lid.width())),
+                        QColor(250, 244, 238))
+            if hires:
+                hf = ui_font(7, QFont.DemiBold)
+                hf.setLetterSpacing(QFont.AbsoluteSpacing, 1.2)
+                p.setFont(hf)
+                p.setPen(QColor(255, 225, 230, 120))
+                p.drawText(QRectF(24, 62, self.W - 48, 11), Qt.AlignCenter, "Hi-Res")
+            p.setFont(ui_font(8.5, QFont.DemiBold))
+            shadow_text(p, QRectF(24, 74 if hires else 66, self.W - 48, 16), Qt.AlignCenter, t, QColor(255, 214, 196, 210))
+            p.end()
+            self._text_key, self._text_img = key, img
+            return img
         if pl.style == "snow":
             shadow_text(p, title_rect, Qt.AlignCenter, title, QColor(255, 250, 240))
             p.setFont(ui_font(9, QFont.DemiBold))
@@ -4098,10 +4458,10 @@ class DiscTrayApp(QObject):
             card.backdrop.set_rate(self.refresh_hz, on)
 
     def _volume_wheel(self, card, steps: float):
-        want = self.player.volume + steps / 16          # 16 steps from silent to full, like iOS
+        want = self.player.volume + steps / VOLUME_NOTCHES   # one full turn of a typical wheel: silent to full
         self.player.set_volume(want)
         over = want - self.player.volume                 # how far past an end the wheel pushed
-        self.hud.poke(card, overscroll=(1.0 if over > 0 else -1.0) * min(1.0, abs(over) * 16) if over else 0.0)
+        self.hud.poke(card, overscroll=(1.0 if over > 0 else -1.0) * min(1.0, abs(over) * VOLUME_NOTCHES) if over else 0.0)
         self._volume_save.start()
 
     def _set_volume(self, v: float):
@@ -4115,6 +4475,10 @@ class DiscTrayApp(QObject):
     def set_style(self, key: str):
         self.player.style = key
         for card in (self.panel, self.pop):
+            if key in OPAQUE_STYLES:
+                card.backdrop.stop()
+            elif card.isVisible() and card.glass:
+                card.backdrop.start()
             card.reset_sim()
             card._edge_mask = None
             card._lens_serial = -1

@@ -21,6 +21,7 @@ A tray-only music player for Windows. Drop an audio file on its tray icon and it
   - **Frutiger Aero.**
   - **Snow Globe:** snow with physics. Shake the pop-out!
   - **Liquid:** clear water that sloshes (real shallow-water physics), throws droplets that cling to the glass and run down, and fills with bubbles when shaken hard.
+  - **Record Player:** a suitcase turntable whose tonearm swings onto the record when you press play and follows the groove inward as the song plays.
 
 ## Install
 
