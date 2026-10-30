@@ -33,7 +33,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
@@ -2188,6 +2188,7 @@ def paint_speaker(p: QPainter, c: QPointF, level: float, color: QColor):
 STYLES = {"glassy": "Glassy", "glossy": "Glossy Glass", "aero": "Frutiger Aero",
           "snow": "Snow Globe", "liquid": "Liquid", "turntable": "Record Player"}
 OPAQUE_STYLES = {"turntable"}   # solid styles: no glass, so no background capture
+POP_GLIDE_MS = 1250            # tray click: the pop-out's glide over and back (sine-out)
 VOLUME_NOTCHES = 12             # Ctrl + scroll: wheel notches from silent to full (about one full turn)
 
 # Record Player: the record lies on the deck, seen at an angle (vertical squash),
@@ -4094,7 +4095,7 @@ class DiscTrayApp(QObject):
         self.act_norm.toggled.connect(self.set_normalize)
         settings.addAction(self.act_norm)
         self.act_bouncy = QAction("Bouncy pop-out (throw it around)", settings, checkable=True)
-        self.act_bouncy.setChecked(self.cfg.get("bouncy", True))
+        self.act_bouncy.setChecked(False)   # always starts off; switch it on per session
         self.act_bouncy.toggled.connect(self.set_bouncy)
         settings.addAction(self.act_bouncy)
         self.act_capture = QAction("Show in screenshots && recordings", settings, checkable=True)
@@ -4230,7 +4231,7 @@ class DiscTrayApp(QObject):
             self._pop_home = self.pop.pos()
         self.pop.summoned = True
         self.pop.preview = not activate
-        self._ease_pop(self._panel_pos(), 380, QEasingCurve.OutCubic)
+        self._ease_pop(self._panel_pos(), POP_GLIDE_MS, QEasingCurve.OutSine)
         self.pop.raise_()
         if activate:
             self.pop.activateWindow()
@@ -4243,7 +4244,7 @@ class DiscTrayApp(QObject):
         home, self._pop_home = self._pop_home, None
         self._last_hide = time.monotonic()
         if home is not None:
-            self._ease_pop(home, 460, QEasingCurve.InOutCubic)
+            self._ease_pop(home, POP_GLIDE_MS, QEasingCurve.OutSine)
 
     def _ease_pop(self, target: QPoint, ms: int, curve):
         self.pop._glide.stop()
@@ -4500,9 +4501,7 @@ class DiscTrayApp(QObject):
             save_config(self.cfg)
 
     def set_bouncy(self, on: bool):
-        self.pop.bouncy = on
-        self.cfg["bouncy"] = on
-        save_config(self.cfg)
+        self.pop.bouncy = on   # not saved: every launch starts with it off
 
     def check_updates(self):
         import subprocess
