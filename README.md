@@ -31,7 +31,9 @@ A tray-only music player for Windows. Drop an audio file on its tray icon and it
 1. Download **`DiscTrayUpdater.exe`** from the [latest release](https://github.com/ASQUALL-hub/disctray/releases/latest).
 2. Run it. It installs the newest version for your user only (no admin rights) to `%LOCALAPPDATA%\Programs\DiscTray`, adds a Start Menu shortcut and starts DiscTray.
 
-The exe isn't code-signed, so Windows SmartScreen may warn the first time: choose **More info → Run anyway**.
+The exe isn't code-signed, so Windows SmartScreen may warn the first time: choose **More info → Run anyway**. The updater is a small native program (about 100 KB, source in [`updater/Updater.cs`](updater/Updater.cs)) that only downloads the release zip from this repo and unpacks it into your profile.
+
+If your browser or antivirus still blocks the download, it's a false positive on a new, unsigned file. You can also install without the updater: download `DiscTray-<version>-win64.zip` from the release, unzip it anywhere and run `DiscTray.exe`.
 
 **Updating:** tray menu → **Check for updates…**, or run the updater again.
 **Uninstalling:** *Settings → Apps → DiscTray → Uninstall*, or `DiscTrayUpdater.exe --uninstall`.
@@ -54,7 +56,7 @@ pip install pyinstaller pillow
 python build.py
 ```
 
-This writes `dist/DiscTray-<version>-win64.zip` (what the updater downloads) and `dist/DiscTrayUpdater.exe`. To publish, bump `__version__` in `disctray.py`, build, then:
+This writes `dist/DiscTray-<version>-win64.zip` (what the updater downloads) and `dist/DiscTrayUpdater.exe`. The app is built with PyInstaller. The updater is compiled from `updater/Updater.cs` with the C# compiler that ships with Windows (`%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe`), so it needs nothing extra. To publish, bump `__version__` in `disctray.py`, build, then:
 
 ```bash
 gh release create v<version> dist/DiscTray-<version>-win64.zip dist/DiscTrayUpdater.exe

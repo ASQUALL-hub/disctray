@@ -33,7 +33,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
