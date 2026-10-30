@@ -33,7 +33,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
@@ -1536,7 +1536,7 @@ def paint_glass_chip(p: QPainter, shape, fill: int, rim: float = 1.0):
 # ------------------------------------------------------------------ backdrop blur
 
 CAPTURE_PAD = 18   # desktop captured beyond each edge; the glass edge bends it inward
-MOVING_PAD = 64    # wider while the window moves, so a capture still covers it between refreshes
+MOVING_PAD = 160   # wider while the window moves, so a capture still covers it between refreshes
 
 
 def _box_blur(a: np.ndarray, r: int, axis: int) -> np.ndarray:
@@ -1662,12 +1662,17 @@ class BackdropWorker(QThread):
         dib = prev = prev_win = None
         moving_until = 0.0
         last_change = 0.0
+        recent: list[tuple[float, tuple]] = []   # where the card was lately (screen rects)
         r = RECT()
         try:
             while self.running:
                 t0 = time.perf_counter()
                 if user32.GetWindowRect(self.hwnd, ctypes.byref(r)):
                     win = (r.left, r.top, r.right, r.bottom)
+                    # Windows composes a moving window a frame or two late, so a capture
+                    # can still show the card where it just was: treat those spots as card too
+                    recent.append((t0, win))
+                    recent = [rv for rv in recent if t0 - rv[0] < 0.15]
                     if prev_win is not None and win[:2] != prev_win[:2]:
                         moving_until = t0 + 0.25   # moving: capture wider so it keeps covering the card
                     pad = round((MOVING_PAD if t0 < moving_until else CAPTURE_PAD) * self.dpr)
@@ -1677,18 +1682,23 @@ class BackdropWorker(QThread):
                         if dib is not None:
                             dib.close()
                         dib, prev = _Dib(w, h), None
+                    holes = []
                     if dib.grab(x, y):
                         frame = dib.arr
                         if self.inpaint:   # our own (animated) card is in the picture: ignore it
                             frame = frame.copy()
-                            frame[pad:h - pad, pad:w - pad] = 0
+                            for _, (l, tp, rt, bt) in recent:
+                                hl, ht, hr, hb = max(0, l - x), max(0, tp - y), min(w, rt - x), min(h, bt - y)
+                                if hr > hl and hb > ht:
+                                    frame[ht:hb, hl:hr] = 0
+                                    holes.append((hl, ht, hr, hb))
                         changed = prev is None or win != prev_win or not np.array_equal(frame, prev)
                     else:
                         changed = False
                     if changed:
                         prev, prev_win = (frame if self.inpaint else frame.copy()), win
                         last_change = t0
-                        frost, lens = self._layers(prev, pad)
+                        frost, lens = self._layers(prev, pad, holes)
                         with self._lock:
                             self._latest = (frost, lens, (x, y, w, h))
                         self.ready.emit()
@@ -1699,17 +1709,20 @@ class BackdropWorker(QThread):
             if dib is not None:
                 dib.close()
 
-    def _layers(self, arr: np.ndarray, pad: int):
+    def _layers(self, arr: np.ndarray, pad: int, holes=()):
         h, w = arr.shape[:2]
         img = QImage(arr.data, w, h, w * 4, QImage.Format_RGB32)
         if self.inpaint:
-            # The window is visible to capture, so the capture shows the card itself.
-            # Rebuild what's behind it from the surroundings instead (push-pull fill).
+            # The window is visible to capture, so the capture shows the card itself
+            # (where it is and where it just was). Rebuild what's behind those spots
+            # from the surroundings instead (push-pull fill).
             small = _small_array(img, 4)
             sh, sw = small.shape[:2]
             mask = np.ones((sh, sw), np.float32)
-            p0 = max(0, pad // 4 - 1)
-            mask[p0: sh - p0, p0: sw - p0] = 0
+            if not holes:
+                holes = [(pad, pad, w - pad, h - pad)]
+            for l, tp, rt, bt in holes:
+                mask[max(0, tp // 4 - 1): bt // 4 + 2, max(0, l // 4 - 1): rt // 4 + 2] = 0
             filled = fill_holes(small, mask)
             frost = frost_from(filled, 4, 1.6)
             inset = max(0, (pad - round(CAPTURE_PAD * self.dpr)) // 4)
@@ -3279,7 +3292,10 @@ class DiscCard(QWidget):
         frost = self.backdrop.frost if self.glass else None
         fr = self.backdrop.frost_rect() if frost is not None else None
         if fr is not None:
-            # anchored to the screen: while moving, the last capture stays where it was taken
+            # anchored to the screen: while moving, the last capture stays where it was
+            # taken; if the card outruns it, it slides along instead of leaving a bare patch
+            fr.moveLeft(min(0.0, max(fr.left(), self.W - fr.width())))
+            fr.moveTop(min(0.0, max(fr.top(), self.H - fr.height())))
             bp.fillRect(self.rect(), QColor(24, 24, 32))
             bp.drawImage(fr, frost)
             lens = self._lens()
