@@ -33,7 +33,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
@@ -1856,56 +1856,240 @@ class SnowSim:
 
 
 class WaterSim:
-    """The water surface as a row of columns joined by springs. Each column is
-    pulled toward the height that gravity plus the card's acceleration gives (the
-    surface leans by -a/g, like water in a glass you push), and pulls on its
-    neighbours, which is what carries waves across. Volume is kept constant."""
+    """Water in the card as 1-D shallow-water (Saint-Venant) equations on a staggered
+    grid: column heights `h` and the flow `u` between columns, walls at both ends.
+    The card's own acceleration is a body force on the flow, so a shove sends the
+    water's mass up the far wall and it rocks back at the tank's natural sloshing
+    period, with waves that steepen as they travel. Fast-rising crests throw
+    droplets; droplets that hit the glass stick and later run down; intense motion
+    stirs air bubbles into the water. Card coordinates: px, y down."""
 
-    N = 48
-    G = 1400.0   # "down", in px/s^2
+    N = 72
+    G = 2200.0           # gravity for the water (px/s^2): about a 1 s slosh in this card
+    G_DROP = 1700.0      # gravity for flying droplets
+    FRICTION = 0.9       # 1/s, slows the flow
+    VISCOSITY = 380.0    # px^2/s, keeps the crests smooth
+    SHOVE = 0.35         # share of the window's acceleration the water feels
+    TENSION = 220.0      # px^2/s, surface tension smoothing
+    MAX_FLYING, MAX_CLING, MAX_BUBBLES = 120, 90, 70
 
-    def __init__(self, width: float, depth: float, seed: int = 3):
+    def __init__(self, width: float, height: float, level_y: float, seed: int = 3):
         self.rng = np.random.default_rng(seed)
-        self.width, self.depth = width, depth
-        self.x = np.linspace(-width / 2, width / 2, self.N)
-        self.h = np.zeros(self.N)
-        self.v = np.zeros(self.N)
-        self.bub = np.zeros((0, 4))   # x, y (card coords), rise speed, radius
+        self.W, self.H = float(width), float(height)
+        self.depth = self.H - level_y
+        self.dx = self.W / self.N
+        self.x = (np.arange(self.N) + 0.5) * self.dx
+        self.h = np.full(self.N, self.depth)
+        self.u = np.zeros(self.N + 1)
+        self.volume = float(self.h.sum())
+        self._prev_h = self.h.copy()
+        self.w = np.zeros(self.N)                    # how fast the surface rises (px/s)
+        self.flying = np.zeros((0, 5))               # x, y, vx, vy, r
+        self.bub = np.zeros((0, 4))                  # x, y, r, wobble phase
+        # condensation on the glass above the water, like the wallpaper
+        n = 26
+        r = np.clip(0.9 + self.rng.gamma(2.0, 0.55, n), 0.9, 4.2)
+        self.cling = np.stack([self.rng.uniform(8, self.W - 8, n), self.rng.uniform(10, level_y - 26, n),
+                               r, np.zeros(n)], axis=1)   # x, y, r, sliding speed
 
-    def surface(self, level_y: float):
-        return self.x + self.width / 2, level_y - self.h
+    # --- geometry
+    def surface_y(self) -> np.ndarray:
+        return self.H - self.h
 
-    def step(self, dt: float, accel, stir: float, level_y: float, height: float) -> bool:
-        ax, ay = accel
-        g = max(300.0, self.G + ay)
-        target = np.clip(-ax / g, -0.7, 0.7) * self.x
-        lap = np.empty(self.N)
-        for _ in range(2):
-            sdt = dt / 2
-            lap[1:-1] = self.h[:-2] + self.h[2:] - 2 * self.h[1:-1]
-            lap[0] = self.h[1] - self.h[0]
-            lap[-1] = self.h[-2] - self.h[-1]
-            acc = 38 * (target - self.h) + 900 * lap - 2.2 * self.v
-            if stir > 0:
-                acc += self.rng.normal(0, 260 * stir, self.N)
-            self.v += acc * sdt
-            self.h += self.v * sdt
-            self.h -= self.h.mean()
-        np.clip(self.h, -self.depth * 0.85, level_y * 0.9, out=self.h)
-        energy = float(np.abs(self.v).max() + np.abs(self.h - target).max())
-        # bubbles: rise, wobble, drift with the slosh; new ones only while things move
+    def surface_at(self, x) -> np.ndarray:
+        return np.interp(x, self.x, self.surface_y())
+
+    def _dip(self, x: float, amount: float):
+        """Something fell in or popped out: push the surface locally (it spreads as a ripple)."""
+        weights = np.exp(-0.5 * ((self.x - x) / (2.2 * self.dx)) ** 2)   # a soft dent, not a notch
+        self.h -= amount * 0.6 * weights / weights.sum() * 5
+
+    # --- one frame
+    def step(self, dt: float, accel, stir: float) -> bool:
+        rng = self.rng
+        # the water feels only part of the window's acceleration (window moves are fast
+        # in pixel terms; full strength would slosh it about on the slightest drag)
+        ax, ay = accel[0] * self.SHOVE, accel[1] * self.SHOVE
+        g = max(400.0, self.G + ay)                  # accelerating upward presses the water down
+        h, u, dx = self.h, self.u, self.dx
+        left = dt
+        while left > 1e-6:
+            # stable step: waves and flow must not cross more than half a column per step
+            speed = float(np.abs(u).max()) + math.sqrt(g * float(h.max()))
+            sdt = min(left, 0.004, 0.45 * dx / max(speed, 1.0))
+            left -= sdt
+            ui = u[1:-1]
+            dhdx = (h[1:] - h[:-1]) / dx
+            back = (ui - u[:-2]) / dx                # upwind slope for carrying the flow along
+            fwd = (u[2:] - ui) / dx
+            adv = ui * np.where(ui > 0, back, fwd)
+            lap = (u[2:] - 2 * ui + u[:-2]) / (dx * dx)
+            ui += sdt * (-g * dhdx - ax - adv - self.FRICTION * ui + self.VISCOSITY * lap)
+            if stir > 0:   # the record's hum: faint ripples
+                ui += rng.normal(0, 14 * stir, ui.size) * sdt
+            np.clip(ui, -650, 650, out=ui)
+            depth_up = np.where(ui > 0, h[:-1], h[1:])   # upwind: carry the water that flows
+            flux = np.zeros(self.N + 1)
+            flux[1:-1] = depth_up * ui
+            h -= sdt * (flux[1:] - flux[:-1]) / dx
+            hl = np.empty_like(h)                     # surface tension: rounds off sharp kinks
+            hl[1:-1] = h[:-2] - 2 * h[1:-1] + h[2:]
+            hl[0], hl[-1] = h[1] - h[0], h[-2] - h[-1]
+            h += sdt * self.TENSION * hl / (dx * dx)
+            np.clip(h, 1.0, self.H - 3, out=h)
+        h += (self.volume - h.sum()) / self.N              # keep the amount of water exact
+        if not (np.isfinite(h).all() and np.isfinite(u).all()):   # never let a bad step stick
+            h[:] = self.depth
+            u[:] = 0
+            self._prev_h = h.copy()
+        self.w = (h - self._prev_h) / dt
+        self._prev_h = h.copy()
+        surf = self.surface_y()
+
+        # crests that shoot up throw droplets
+        hot = np.nonzero((self.w > 300) & (h > self.depth + 8))[0]
+        if len(hot) and len(self.flying) < self.MAX_FLYING:
+            pick = hot[rng.random(len(hot)) < np.clip((self.w[hot] - 300) / 300, 0, 1) * dt * 30]
+            for i in pick[: self.MAX_FLYING - len(self.flying)]:
+                uc = 0.5 * (u[i] + u[i + 1])
+                drop = [self.x[i] + rng.normal(0, 2), surf[i] - 1, uc * 0.8 + rng.normal(0, 55),
+                        -(self.w[i] * rng.uniform(0.6, 1.2) + 40), rng.uniform(1.0, 3.0)]
+                self.flying = np.vstack([self.flying, drop])
+
+        # intense movement drags air under the surface
+        intensity = max(0.0, (math.hypot(ax, ay) - 1100) / 500) + max(0.0, (float(np.abs(self.w).max()) - 420) / 160)
+        if intensity > 0 and len(self.bub) < self.MAX_BUBBLES:
+            k = int(min(self.MAX_BUBBLES - len(self.bub), rng.poisson(min(intensity, 6) * dt * 40)))
+            if k:
+                bx = rng.uniform(6, self.W - 6, k)
+                by = self.surface_at(bx) + rng.uniform(3, 42, k)
+                br = np.clip(rng.gamma(2.0, 0.9, k), 0.8, 4.8)
+                self.bub = np.vstack([self.bub, np.stack([bx, by, br, rng.uniform(0, 6.3, k)], axis=1)])
+
+        self._step_flying(dt, ax, ay)
+        self._step_cling(dt)
+        self._step_bubbles(dt)
+        moving = float(np.abs(u).max()) > 2 or float(np.abs(self.w).max()) > 2
+        return moving or len(self.flying) > 0 or len(self.bub) > 0 or bool((self.cling[:, 3] > 0).any()) or stir > 0
+
+    def _step_flying(self, dt, ax, ay):
+        f = self.flying
+        if not len(f):
+            return
+        f[:, 2] += (-ax - 0.6 * f[:, 2]) * dt
+        f[:, 3] += (self.G_DROP - ay - 0.6 * f[:, 3]) * dt
+        f[:, 0] += f[:, 2] * dt
+        f[:, 1] += f[:, 3] * dt
+        keep = np.ones(len(f), bool)
+        stick = []
+        for i, (x, y, vx, vy, r) in enumerate(f):
+            if y >= self.surface_at(x) and vy > 0:          # back into the water
+                keep[i] = False
+                self._dip(x, 0.08 * r)
+            elif x < r + 2 or x > self.W - r - 2 or y < r + 2:  # hit the glass: it clings
+                keep[i] = False
+                stick.append([min(max(x, r + 2), self.W - r - 2), max(y, r + 2), r, 0.0])
+        self.flying = f[keep]
+        if stick and len(self.cling) < self.MAX_CLING:
+            self.cling = np.vstack([self.cling, np.array(stick[: self.MAX_CLING - len(self.cling)])])
+
+    def _step_cling(self, dt):
+        c = self.cling
+        if not len(c):
+            return
+        rng = self.rng
+        # touching drops merge into one bigger drop
+        for _ in range(3):
+            if len(c) < 2:
+                break
+            d = np.hypot(c[:, None, 0] - c[None, :, 0], c[:, None, 1] - c[None, :, 1])
+            np.fill_diagonal(d, 1e9)
+            i, j = np.unravel_index(np.argmin(d - (c[:, None, 2] + c[None, :, 2]) * 0.85), d.shape)
+            if d[i, j] >= (c[i, 2] + c[j, 2]) * 0.85:
+                break
+            vi, vj = c[i, 2] ** 3, c[j, 2] ** 3
+            c[i, 0] = (c[i, 0] * vi + c[j, 0] * vj) / (vi + vj)
+            c[i, 1] = (c[i, 1] * vi + c[j, 1] * vj) / (vi + vj)
+            c[i, 2] = (vi + vj) ** (1 / 3)
+            c = np.delete(c, j, axis=0)
+        # heavy drops run down in fits and starts, leaving tiny droplets behind
+        big = c[:, 2] > 2.4
+        start = big & (c[:, 3] == 0) & (rng.random(len(c)) < 0.8 * dt * (c[:, 2] - 2.4))
+        c[start, 3] = (c[start, 2] - 2.4) * 22 + 6
+        stop = (c[:, 3] > 0) & (rng.random(len(c)) < dt * 1.2)
+        c[stop, 3] = 0
+        c[:, 1] += c[:, 3] * dt
+        trail = (c[:, 3] > 0) & (rng.random(len(c)) < dt * 2.5) & (c[:, 2] > 1.6)
+        if trail.any() and len(c) < self.MAX_CLING:
+            bits = np.stack([c[trail, 0] + rng.normal(0, 0.6, trail.sum()), c[trail, 1] - c[trail, 2],
+                             np.full(trail.sum(), 0.8), np.zeros(trail.sum())], axis=1)
+            c[trail, 2] = np.maximum(1.0, c[trail, 2] * 0.97)
+            c = np.vstack([c, bits])
+        # reaching the water (or a wave reaching them) absorbs them
+        wet = c[:, 1] + c[:, 2] >= self.surface_at(c[:, 0])
+        for x, r in c[wet][:, [0, 2]]:
+            self._dip(x, 0.05 * r)
+        self.cling = c[~wet]
+
+    def _step_bubbles(self, dt):
         b = self.bub
-        if len(b) < 14 and (stir > 0 or energy > 8) and self.rng.random() < dt * (6 if stir else 3):
-            nb = [self.rng.uniform(12, self.width - 12), height - 6, self.rng.uniform(28, 60), self.rng.uniform(1.4, 3.2)]
-            b = np.vstack([b, nb])
-        if len(b):
-            b[:, 1] -= b[:, 2] * dt
-            b[:, 0] += (-ax * 0.012 + np.sin(b[:, 1] * 0.08) * 14) * dt
-            sx, sy = self.surface(level_y)
-            surf = np.interp(b[:, 0], sx, sy)
-            b = b[(b[:, 1] > surf + b[:, 3]) & (b[:, 0] > 2) & (b[:, 0] < self.width - 2)]
-        self.bub = b
-        return energy > 0.3 or stir > 0 or len(b) > 0
+        if not len(b):
+            return
+        flow = np.interp(b[:, 0], np.arange(self.N + 1) * self.dx, self.u)
+        b[:, 3] += dt * 9
+        b[:, 0] += (flow * 0.5 + np.sin(b[:, 3]) * 14) * dt
+        b[:, 1] -= (35 + 20 * b[:, 2]) * dt
+        np.clip(b[:, 0], 3, self.W - 3, out=b[:, 0])
+        popped = b[:, 1] - b[:, 2] <= self.surface_at(b[:, 0])
+        for x, r in b[popped][:, [0, 2]]:
+            self._dip(x, -0.05 * r)
+        self.bub = b[~popped]
+
+
+def drop_sprite(r: float, kind: str) -> QPixmap:
+    """A water drop on glass (dark rim, light focused at the bottom, sharp highlight)
+    or an air bubble in water (bright rim, clear middle)."""
+    d = int(math.ceil(r * 2 + 4))
+    img = QImage(d * 2, d * 2, QImage.Format_ARGB32_Premultiplied)
+    img.setDevicePixelRatio(2.0)
+    img.fill(Qt.transparent)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.Antialiasing)
+    c = QPointF(d / 2, d / 2)
+    if kind == "drop":
+        body = QLinearGradient(c.x(), c.y() - r, c.x(), c.y() + r)
+        body.setColorAt(0.0, QColor(15, 25, 30, 120))
+        body.setColorAt(0.55, QColor(120, 135, 140, 35))
+        body.setColorAt(1.0, QColor(255, 255, 255, 165))
+        p.setPen(Qt.NoPen)
+        p.setBrush(body)
+        p.drawEllipse(c, r, r)
+        rim = QLinearGradient(c.x(), c.y() - r, c.x(), c.y() + r)
+        rim.setColorAt(0.0, QColor(0, 0, 0, 150))
+        rim.setColorAt(1.0, QColor(0, 0, 0, 40))
+        p.setPen(QPen(rim, max(0.6, r * 0.2)))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(c, r - max(0.3, r * 0.1), r - max(0.3, r * 0.1))
+        p.setPen(QPen(QColor(255, 255, 255, 180), max(0.5, r * 0.2)))
+        p.drawArc(QRectF(c.x() - r * 0.7, c.y() - r * 0.7, r * 1.4, r * 1.4), 205 * 16, 130 * 16)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 240))
+        p.drawEllipse(QPointF(c.x() - r * 0.35, c.y() - r * 0.42), r * 0.26, r * 0.18)
+    else:
+        body = QRadialGradient(c, r)
+        body.setColorAt(0.0, QColor(255, 255, 255, 10))
+        body.setColorAt(0.8, QColor(230, 245, 255, 40))
+        body.setColorAt(1.0, QColor(255, 255, 255, 120))
+        p.setPen(QPen(QColor(255, 255, 255, 175), max(0.5, r * 0.16)))
+        p.setBrush(body)
+        p.drawEllipse(c, r, r)
+        p.setPen(QPen(QColor(0, 30, 50, 60), max(0.5, r * 0.14)))
+        p.drawArc(QRectF(c.x() - r * 0.72, c.y() - r * 0.72, r * 1.44, r * 1.44), 210 * 16, 120 * 16)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 235))
+        p.drawEllipse(QPointF(c.x() - r * 0.38, c.y() - r * 0.38), r * 0.24, r * 0.2)
+    p.end()
+    return QPixmap.fromImage(img)
 
 
 def rounded_polygon(points, r: float) -> QPainterPath:
@@ -2231,7 +2415,8 @@ class DiscCard(QWidget):
         self.player = player
         self.popout = popout
         self.popped = False        # panel only: whether the pop-out is showing
-        self.preview = False       # panel only: shown by a drag over the tray icon
+        self.preview = False       # shown by a drag over the tray icon (not activated)
+        self.summoned = False      # pop-out only: brought over by a tray click
         self._appear = 1.0
         self._hover_disc = False
         self._hover_btn = False
@@ -2307,6 +2492,7 @@ class DiscCard(QWidget):
         self._win_v = QPointF()
         self._accel = (0.0, 0.0)
         self._flakes = flake_sprites()
+        self._drop_sprites: dict = {}
         self._scene_key = None
         self._scene_back: QImage | None = None
         self._scene_front_key = None
@@ -2407,8 +2593,8 @@ class DiscCard(QWidget):
             active = self._snow.step(dt, (ax, ay), stir)
         else:
             if self._water is None:
-                self._water = WaterSim(self.W, self.H * (1 - WATER_LEVEL))
-            active = self._water.step(dt, (ax, ay), stir, self.H * WATER_LEVEL, self.H)
+                self._water = WaterSim(self.W, self.H, self.H * WATER_LEVEL)
+            active = self._water.step(dt, (ax, ay), stir)
         self.update()
         if not active and abs(v.x()) + abs(v.y()) < 1 and abs(ax) + abs(ay) < 1:
             self._sim_timer.stop()
@@ -2579,17 +2765,30 @@ class DiscCard(QWidget):
         self._scene_front_key, self._scene_front = key, img
         return img
 
-    def _paint_water(self, p: QPainter):
+    def _sprite(self, kind: str, r: float) -> QPixmap:
+        key = (kind, round(r * 2) / 2)
+        pm = self._drop_sprites.get(key)
+        if pm is None:
+            pm = self._drop_sprites[key] = drop_sprite(key[1], kind)
+        return pm
+
+    def _blit(self, p: QPainter, kind: str, x: float, y: float, r: float):
+        pm = self._sprite(kind, r)
+        w = pm.width() / pm.devicePixelRatio()
+        p.drawPixmap(QPointF(x - w / 2, y - w / 2), pm)
+
+    def _paint_water(self, p: QPainter, scene: QImage):
+        """Clear water: what's under the surface is the card itself, magnified and a
+        little darker toward the bottom, with a crisp waterline; then the bubbles in
+        it and the drops on the glass."""
         sim = self._water
-        level_y = self.H * WATER_LEVEL
         if sim is None:
-            xs, ys = np.linspace(0, self.W, 8), np.full(8, level_y)
-            bubbles = []
+            xs, ys = np.linspace(0, self.W, 8), np.full(8, self.H * WATER_LEVEL)
         else:
-            xs, ys = sim.surface(level_y)
-            bubbles = sim.bub
+            xs, ys = sim.x, sim.surface_y()
         surface = QPainterPath()
         surface.moveTo(-2, float(ys[0]))
+        surface.lineTo(float(xs[0]), float(ys[0]))
         for i in range(1, len(xs)):   # smooth curve through the column tops
             mx, my = (xs[i - 1] + xs[i]) / 2, (ys[i - 1] + ys[i]) / 2
             surface.quadTo(QPointF(float(xs[i - 1]), float(ys[i - 1])), QPointF(float(mx), float(my)))
@@ -2598,34 +2797,53 @@ class DiscCard(QWidget):
         body.lineTo(self.W + 2, self.H + 2)
         body.lineTo(-2, self.H + 2)
         body.closeSubpath()
-        layer = self._layer()
-        lp = QPainter(layer)
-        lp.setRenderHint(QPainter.Antialiasing)
+
+        water = self._layer()
+        wp = QPainter(water)
+        wp.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        # refraction: the scene behind the water, magnified about the bottom centre
+        wp.save()
+        wp.translate(self.W / 2, self.H)
+        wp.scale(1.07, 1.07)
+        wp.translate(-self.W / 2, -self.H)
+        wp.drawImage(0, 0, scene)
+        wp.restore()
         top = float(ys.min())
-        g = QLinearGradient(0, top, 0, self.H)
-        g.setColorAt(0.0, QColor(120, 220, 255, 110))
-        g.setColorAt(0.35, QColor(50, 150, 235, 140))
-        g.setColorAt(1.0, QColor(14, 58, 160, 180))
-        lp.fillPath(body, g)
-        glow = QPen(QColor(200, 245, 255, 40), 10)
-        lp.setPen(glow)
+        tint = QLinearGradient(0, top, 0, self.H)
+        tint.setColorAt(0.0, QColor(175, 228, 236, 34))
+        tint.setColorAt(0.5, QColor(120, 160, 175, 46))
+        tint.setColorAt(1.0, QColor(30, 45, 58, 110))
+        wp.fillRect(self.rect(), tint)
+        if sim is not None:
+            for x, y, r, _ in sim.bub:
+                self._blit(wp, "bubble", x, y, r)
+        wp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+        wp.setPen(Qt.NoPen)
+        wp.setBrush(Qt.black)
+        wp.drawPath(body)
+        wp.end()
+        p.drawImage(0, 0, water)
+
+        # the waterline: light just under it, a thin dark meniscus, a bright edge
+        line = self._layer()
+        lp = QPainter(line)
+        lp.setRenderHint(QPainter.Antialiasing)
+        lp.setPen(QPen(QColor(220, 245, 255, 34), 9))
         lp.drawPath(surface.translated(0, 6))
-        lp.setPen(QPen(QColor(255, 255, 255, 215), 1.6))
+        lp.setPen(QPen(QColor(0, 20, 30, 70), 1.0))
+        lp.drawPath(surface.translated(0, 1.6))
+        lp.setPen(QPen(QColor(255, 255, 255, 235), 1.4))
         lp.drawPath(surface)
-        lp.setPen(QPen(QColor(255, 255, 255, 70), 1.0))
-        lp.drawPath(surface.translated(0, 3.5))
-        for bx, by, _, br in bubbles:
-            lp.setPen(QPen(QColor(255, 255, 255, 150), 0.9))
-            lp.setBrush(QColor(255, 255, 255, 26))
-            lp.drawEllipse(QPointF(bx, by), br, br)
-            lp.setPen(Qt.NoPen)
-            lp.setBrush(QColor(255, 255, 255, 200))
-            lp.drawEllipse(QPointF(bx - br * 0.35, by - br * 0.35), br * 0.3, br * 0.3)
+        if sim is not None:
+            for x, y, r, _ in sim.cling:
+                self._blit(lp, "drop", x, y, r)
+            for x, y, _, _, r in sim.flying:
+                self._blit(lp, "drop", x, y, r)
         lp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
         card = self._card_path()
         lp.drawImage(0, 0, self._mask("card", lambda m: m.drawPath(card)))
         lp.end()
-        p.drawImage(0, 0, layer)
+        p.drawImage(0, 0, line)
 
     def moveEvent(self, e):
         self._wake_sim()
@@ -2738,7 +2956,7 @@ class DiscCard(QWidget):
     def event(self, e):
         if e.type() == QEvent.WindowActivate:
             self.preview = False
-        elif e.type() == QEvent.WindowDeactivate and not self.popout:
+        elif e.type() == QEvent.WindowDeactivate:
             self.deactivated.emit()
         return super().event(e)
 
@@ -2874,6 +3092,15 @@ class DiscCard(QWidget):
         img = self._layer()
         tp = QPainter(img)
         tp.setRenderHint(QPainter.Antialiasing)
+        if pl.style == "liquid":
+            sky = QLinearGradient(0, 0, 0, self.H)
+            sky.setColorAt(0.0, QColor(70, 160, 172, 70))
+            sky.setColorAt(0.45, QColor(205, 210, 214, 46))
+            sky.setColorAt(1.0, QColor(36, 38, 44, 90))
+            tp.fillRect(self.rect(), sky)
+            tp.end()
+            self._tint_key, self._tint_img = key, img
+            return img
         if pl.style == "snow":   # a winter night behind the globe
             night = QLinearGradient(0, 0, 0, self.H)
             night.setColorAt(0.0, QColor(16, 30, 76, 150))
@@ -2976,6 +3203,22 @@ class DiscCard(QWidget):
         base_opacity = p.opacity()
 
         # everything that doesn't spin comes from cached layers
+        if pl.style == "liquid":
+            # draw the dry scene first: the water refracts it
+            scene = self._layer()
+            sp = QPainter(scene)
+            sp.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+            sp.drawImage(0, 0, self._body(vis))
+            sp.drawImage(0, 0, self._decor(vis))
+            self._paint_disc(sp, 1.0, vis)
+            sp.end()
+            p.drawImage(0, 0, scene)
+            p.setOpacity(base_opacity)
+            self._paint_water(p, scene)
+            p.setOpacity(base_opacity * vis)
+            p.drawImage(0, 0, self._text())
+            p.end()
+            return
         p.drawImage(0, 0, self._body(vis))
         if pl.style == "snow":
             p.drawImage(0, 0, self._snow_back())
@@ -2985,8 +3228,6 @@ class DiscCard(QWidget):
         else:
             p.drawImage(0, 0, self._decor(vis))
             self._paint_disc(p, base_opacity, vis)
-            if pl.style == "liquid":
-                self._paint_water(p)
 
         p.setOpacity(base_opacity * vis)
         p.drawImage(0, 0, self._text())
@@ -3449,6 +3690,11 @@ class DiscTrayApp(QObject):
             card.popToggle.connect(self.toggle_popout)
             card.fileDropped.connect(self._on_drop)
         self.panel.deactivated.connect(self._panel_deactivated)
+        self.pop.deactivated.connect(self._pop_deactivated)
+        self._pop_home: QPoint | None = None
+        self._pop_from, self._pop_to = QPointF(), QPointF()
+        self._pop_anim = QVariantAnimation(self)
+        self._pop_anim.valueChanged.connect(self._pop_anim_step)
         self.player.set_volume(self.cfg.get("volume", 1.0))
         self.hud = VolumeHud(self.player)
         self.hud.volumeSet.connect(self._set_volume)
@@ -3571,6 +3817,13 @@ class DiscTrayApp(QObject):
     # --- tray
     def _on_tray(self, reason):
         if reason == QSystemTrayIcon.Trigger:
+            if self._pop_showing():
+                # one player only: bring the pop-out over instead of opening the panel
+                if self.pop.summoned:
+                    self.send_pop_home()
+                elif time.monotonic() - self._last_hide > 0.3:
+                    self.summon_pop(activate=True)
+                return
             if self.panel.isVisible() and not self.panel._slide_hide:
                 self.hide_panel()
             elif time.monotonic() - self._last_hide > 0.25:
@@ -3607,7 +3860,54 @@ class DiscTrayApp(QObject):
             y = avail.bottom() - h - m
         return QPoint(x, y)
 
+    def _pop_showing(self) -> bool:
+        return self.pop.isVisible() and not self.pop._slide_hide
+
+    def summon_pop(self, activate: bool):
+        """Glide the pop-out to where the tray panel would open; it returns when you
+        click elsewhere (or, after a drag over the tray icon, once the drop is done)."""
+        if not self.pop.summoned:
+            self._pop_home = self.pop.pos()
+        self.pop.summoned = True
+        self.pop.preview = not activate
+        self._ease_pop(self._panel_pos(), 380, QEasingCurve.OutCubic)
+        self.pop.raise_()
+        if activate:
+            self.pop.activateWindow()
+
+    def send_pop_home(self):
+        if not self.pop.summoned:
+            return
+        self.pop.summoned = False
+        self.pop.preview = False
+        home, self._pop_home = self._pop_home, None
+        self._last_hide = time.monotonic()
+        if home is not None:
+            self._ease_pop(home, 460, QEasingCurve.InOutCubic)
+
+    def _ease_pop(self, target: QPoint, ms: int, curve):
+        self.pop._glide.stop()
+        self.pop._throw.stop()
+        self._pop_from, self._pop_to = QPointF(self.pop.pos()), QPointF(target)
+        self._pop_anim.stop()
+        _run(self._pop_anim, 0.0, 1.0, ms, curve)
+
+    def _pop_anim_step(self, t):
+        f, to = self._pop_from, self._pop_to
+        self.pop.move((f + (to - f) * float(t)).toPoint())
+
+    def _pop_deactivated(self):
+        if self.pop.summoned and not self.pop.preview:
+            self.send_pop_home()
+
     def show_panel(self, preview: bool):
+        if self._pop_showing():
+            if not self.pop.summoned:
+                self.summon_pop(activate=not preview)
+            elif not preview:
+                self.pop.preview = False
+                self.pop.activateWindow()
+            return
         if self.panel.isVisible() and not self.panel._slide_hide:
             if preview:
                 return
@@ -3639,6 +3939,9 @@ class DiscTrayApp(QObject):
         save_config(self.cfg)
 
     def hide_popout(self):
+        self._pop_anim.stop()
+        self.pop.summoned = self.pop.preview = False
+        self._pop_home = None
         self.pop.slide_out()
         self.panel.popped = False
         self.act_pop.setText("Pop out")
@@ -3653,13 +3956,24 @@ class DiscTrayApp(QObject):
             self.hide_panel()
 
     def _save_pop_pos(self, pos: QPoint):
+        if self.pop.summoned:   # dragged somewhere new while visiting the tray: that's home now
+            self.pop.summoned = self.pop.preview = False
+            self._pop_home = None
         self.cfg["popout_pos"] = [pos.x(), pos.y()]
         save_config(self.cfg)
 
     # --- files
+    def _previewing(self):
+        """The card that a drag over the tray icon brought up, if any."""
+        if self.pop.summoned and self.pop.preview:
+            return self.pop
+        if self.panel.isVisible() and self.panel.preview:
+            return self.panel
+        return None
+
     def _on_drop(self, paths: list[str]):
         self.player.load_list(paths)
-        if self.panel.isVisible() and self.panel.preview:
+        if self._previewing() is not None:
             self._preview_timer.start(2600)
 
     def open_file(self):
@@ -3704,15 +4018,18 @@ class DiscTrayApp(QObject):
         if not down and self._was_down:
             if self.catcher.isVisible():
                 QTimer.singleShot(300, self.catcher.hide)
-            if self.panel.isVisible() and self.panel.preview and not self._preview_timer.isActive():
+            if self._previewing() is not None and not self._preview_timer.isActive():
                 self._preview_timer.start(900)
         self._was_down = down
 
     def _preview_check(self):
-        if not (self.panel.isVisible() and self.panel.preview):
+        card = self._previewing()
+        if card is None:
             return
-        if left_button_down() or self.panel.geometry().contains(QCursor.pos()):
+        if left_button_down() or card.geometry().contains(QCursor.pos()):
             self._preview_timer.start(700)
+        elif card is self.pop:
+            self.send_pop_home()
         else:
             self.hide_panel()
 

@@ -5,7 +5,7 @@ A tray-only music player for Windows. Drop an audio file on its tray icon and it
 - **Lives in the tray.** No taskbar button and no main window. Click the icon for the player; it closes when you click away.
 - **Drop and play.** Drag a file onto the tray icon (or the player) and the old track eases out while the new one eases in. Drop several files (or a folder) to get a playlist that loops; drop one file to go back to looping just that.
 - **Turntable feel.** Pausing winds the record down, so the speed and the pitch drop together. Playing spins it back up. The audio engine is sample-accurate, so there are no clicks or pops.
-- **Pop out.** The pop-out button gives you a draggable, always-on-top copy that glides with your mouse.
+- **Pop out.** The pop-out button gives you a draggable, always-on-top copy that glides with your mouse. While it's out, clicking the tray icon glides it over to the tray, and clicking anywhere else sends it back to where it was.
 - **Gets out of the way.**
   - It pauses while another program is truly fullscreen and resumes afterwards.
   - Hold **Caps Lock** and the player fades to a ghost you can click straight through. If you only held it to click through, Caps Lock is switched back for you.
@@ -20,7 +20,7 @@ A tray-only music player for Windows. Drop an audio file on its tray icon and it
   - **Glossy Glass:** a glass record and glossy lettering.
   - **Frutiger Aero.**
   - **Snow Globe:** snow with physics. Shake the pop-out!
-  - **Liquid:** water that sloshes when you move it.
+  - **Liquid:** clear water that sloshes (real shallow-water physics), throws droplets that cling to the glass and run down, and fills with bubbles when shaken hard.
 
 ## Install
 
