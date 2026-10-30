@@ -33,7 +33,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
@@ -912,6 +912,7 @@ class AudioEngine(QObject):
         self._rate = 0.0
         self._vol = 0.0
         self._pos = 0.0           # read position, in source frames
+        self._seek_ms: float | None = None
         self._job: DecodeJob | None = None
         self._threads: set[QThread] = set()
         self._ended = False
@@ -1003,8 +1004,24 @@ class AudioEngine(QObject):
         self._threads.add(thread)
         self._job = job
         self._pos = 0.0
+        self._seek_ms: float | None = None
         self._ended = False
         thread.start()
+
+    def seek(self, ms: float):
+        """Jump to `ms` into the track. Before any audio is decoded the jump waits
+        until the sample rate is known; past what's decoded so far, playback waits
+        in place until the decoder gets there."""
+        job = self._job
+        if job is None or job.n == 0:
+            self._seek_ms = max(0.0, float(ms))
+            return
+        pos = max(0.0, float(ms) / 1000 * job.rate)
+        if job.complete:
+            pos = min(pos, max(0.0, job.n - 2.0))
+        self._pos = pos
+        self._seek_ms = None
+        self._ended = False
 
     def _on_done(self):
         if self.sender() is self._job:
@@ -1012,6 +1029,8 @@ class AudioEngine(QObject):
 
     # --- clock
     def position_ms(self) -> int:
+        if self._seek_ms is not None:
+            return int(self._seek_ms)
         job = self._job
         return int(self._pos / job.rate * 1000) if job is not None and job.n else 0
 
@@ -1037,6 +1056,8 @@ class AudioEngine(QObject):
         complete = job.complete
         if n < 2:
             return silence
+        if self._seek_ms is not None:   # a jump asked for before the sample rate was known
+            self.seek(self._seek_ms)
         ratio = job.rate / self.sr                 # source frames per output frame at normal speed
         src = rates * ratio
         steps = np.concatenate(([0.0], np.cumsum(src[:-1])))
@@ -1153,6 +1174,7 @@ class Player(QObject):
         self.style = "glassy"
         self.hires = False
         self.volume = 1.0        # user volume (Ctrl + scroll), on top of fades and the platter
+        self.scrubbing = False   # Ctrl + dragging the record: hand on the platter, sound muted
         self._pending: str | None = None
         self._disc_cache: dict[int, QPixmap] = {}
         self._sheen_cache: dict[int, QPixmap] = {}
@@ -1215,7 +1237,7 @@ class Player(QObject):
         now = time.perf_counter()
         dt = min(0.1, now - self._last)
         self._last = now
-        self.speed = SPIN_DPS * self.rate   # the disc and the audio share one platter speed
+        self.speed = 0.0 if self.scrubbing else SPIN_DPS * self.rate   # the disc and the audio share one platter speed
         self.angle = (self.angle + self.speed * dt) % 360
         busy = self.rate > 0 or any(a.state() == QVariantAnimation.Running
                                     for a in (self._rate_anim, self._gain_anim, self._vis_anim))
@@ -1366,8 +1388,22 @@ class Player(QObject):
 
     def _apply_volume(self):
         # the sound also fades as the platter slows, so the wind-down ends in silence
-        platter = min(1.0, self.rate / 0.3) ** 1.3
+        platter = 0.0 if self.scrubbing else min(1.0, self.rate / 0.3) ** 1.3
         self.engine.set_targets(self.rate, self.gain * self.gain * platter * self.volume ** 2)
+
+    def begin_scrub(self):
+        self.scrubbing = True
+        self._apply_volume()
+        self._kick()
+
+    def scrub_to(self, ms: float):
+        dur = self.duration()
+        self.engine.seek(max(0.0, min(float(ms), dur - 250 if dur > 500 else float(ms))))
+
+    def end_scrub(self):
+        self.scrubbing = False
+        self._apply_volume()
+        self.changed.emit()
 
     def set_volume(self, v: float):
         self.volume = max(0.0, min(1.0, float(v)))
@@ -2537,6 +2573,12 @@ class DiscCard(QWidget):
         self._tt_img: QImage | None = None
         self._leather: QImage | None = None
         self._arm_t = 0.0           # 0 = tonearm on its rest, 1 = on the record
+        self._scrub: dict | None = None   # Ctrl + drag on the record
+        self._scrub_alpha = 0.0
+        self._scrub_clock = time.perf_counter()
+        self._marquee = None          # (strip image, rect, overflow) when the title doesn't fit
+        self._marquee_title = None
+        self._marquee_t0 = time.perf_counter()
         self._arm_clock = time.perf_counter()
         self._scene_key = None
         self._scene_back: QImage | None = None
@@ -3013,7 +3055,18 @@ class DiscCard(QWidget):
             self.deactivated.emit()
         return super().event(e)
 
+    SCRUB_PX_PER_SONG = 240   # dragging this far (about the card's width) covers the whole song
+
     def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and e.modifiers() & Qt.ControlModifier \
+                and self._in_disc(e.position()) and self.player.path:
+            # Ctrl + grab the record: drag right to skip ahead, left to go back
+            self._scrub = {"x": e.globalPosition().x(), "ms": float(self.player.position()),
+                           "angle": self.player.angle}
+            self.player.begin_scrub()
+            self.setCursor(Qt.ClosedHandCursor)
+            self.update()
+            return
         if e.button() == Qt.LeftButton:
             if self._throw.isActive():   # catch it mid-flight
                 self._throw.stop()
@@ -3024,11 +3077,20 @@ class DiscCard(QWidget):
             self._drag_trail = [(time.perf_counter(), e.globalPosition())]
 
     def mouseMoveEvent(self, e):
+        if self._scrub is not None:
+            dx = e.globalPosition().x() - self._scrub["x"]
+            dur = self.player.duration()
+            self.player.scrub_to(self._scrub["ms"] + dx * dur / self.SCRUB_PX_PER_SONG)
+            self.player.angle = (self._scrub["angle"] + dx * 1.4) % 360   # the record turns under your hand
+            self.update()
+            return
         pos = e.position()
         hd, hb = self._in_disc(pos), self._in_btn(pos)
-        if (hd, hb) != (self._hover_disc, self._hover_btn):
+        ctrl = bool(QGuiApplication.queryKeyboardModifiers() & Qt.ControlModifier)
+        if (hd, hb) != (self._hover_disc, self._hover_btn) or hd:
             self._hover_disc, self._hover_btn = hd, hb
-            self.setCursor(Qt.PointingHandCursor if hd or hb else Qt.ArrowCursor)
+            self.setCursor(Qt.OpenHandCursor if hd and ctrl and self.player.path
+                           else Qt.PointingHandCursor if hd or hb else Qt.ArrowCursor)
             self.update()
         if self.popout and self._press is not None and e.buttons() & Qt.LeftButton:
             delta = e.globalPosition().toPoint() - self._press
@@ -3044,6 +3106,12 @@ class DiscCard(QWidget):
                     self._glide.start()
 
     def mouseReleaseEvent(self, e):
+        if self._scrub is not None and e.button() == Qt.LeftButton:
+            self._scrub = None
+            self.player.end_scrub()
+            self.setCursor(Qt.PointingHandCursor)
+            self.update()
+            return
         if e.button() != Qt.LeftButton or self._press is None:
             return
         self._press = None
@@ -3264,7 +3332,7 @@ class DiscCard(QWidget):
             p.setOpacity(base_opacity)
             self._paint_tonearm(p)
             p.setOpacity(base_opacity * vis)
-            p.drawImage(0, 0, self._text())
+            self._paint_text(p)
             p.end()
             return
         if pl.style == "liquid":
@@ -3280,7 +3348,7 @@ class DiscCard(QWidget):
             p.setOpacity(base_opacity)
             self._paint_water(p, scene)
             p.setOpacity(base_opacity * vis)
-            p.drawImage(0, 0, self._text())
+            self._paint_text(p)
             p.end()
             return
         p.drawImage(0, 0, self._body(vis))
@@ -3294,7 +3362,7 @@ class DiscCard(QWidget):
             self._paint_disc(p, base_opacity, vis)
 
         p.setOpacity(base_opacity * vis)
-        p.drawImage(0, 0, self._text())
+        self._paint_text(p)
         p.end()
 
     def _paint_disc(self, p: QPainter, base_opacity: float, vis: float):
@@ -3317,8 +3385,36 @@ class DiscCard(QWidget):
         p.drawPixmap(target, sheen_pm, QRectF(sheen_pm.rect()))
         if pl.style == "aero":
             paint_aero_disc_gloss(p, QPointF(0, 0), R)
-        if (self._hover_disc or not pl.want_playing) and pl.path:
+        if (self._hover_disc or not pl.want_playing) and pl.path and self._scrub is None:
             self._paint_hub_glyph(p, R * LENS_R, playing=pl.want_playing)
+        self._paint_scrub_ring(p, R)
+        p.restore()
+
+    def _paint_scrub_ring(self, p: QPainter, R: float):
+        """While scrubbing: a thin glossy ring around the record showing where you are."""
+        now = time.perf_counter()
+        dt = min(0.1, now - self._scrub_clock)
+        self._scrub_clock = now
+        target = 1.0 if self._scrub is not None else 0.0
+        self._scrub_alpha += (target - self._scrub_alpha) * (1 - math.exp(-dt / 0.12))
+        if abs(target - self._scrub_alpha) > 0.01:
+            QTimer.singleShot(16, self.update)
+        if self._scrub_alpha < 0.01:
+            return
+        dur = self.player.duration()
+        frac = min(1.0, max(0.0, self.player.position() / dur)) if dur else 0.0
+        ring = QRectF(-R - 5, -R - 5, 2 * R + 10, 2 * R + 10)
+        p.save()
+        p.setOpacity(p.opacity() * self._scrub_alpha)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(0, 0, 0, 90), 5.0))
+        p.drawEllipse(ring)
+        p.setPen(QPen(QColor(255, 255, 255, 60), 3.0))
+        p.drawEllipse(ring)
+        pen = QPen(QColor(255, 255, 255, 240), 3.0)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.drawArc(ring, 90 * 16, -int(frac * 360 * 16))
         p.restore()
 
     def _turntable_back(self) -> QImage:
@@ -3696,6 +3792,69 @@ class DiscCard(QWidget):
         self._decor_key, self._decor_img = key, img
         return img
 
+    def _title_spec(self, hires: bool):
+        """Where the title goes in this style, its font, and how it's drawn."""
+        style = self.player.style
+        if style == "turntable":
+            lf = ui_font(11.5, QFont.Bold)
+            lf.setLetterSpacing(QFont.AbsoluteSpacing, 2.4)
+            lf.setCapitalization(QFont.AllUppercase)
+            return (QRectF(24, 38, self.W - 48, 24), lf,
+                    lambda p, r, t: shadow_text(p, r, Qt.AlignCenter, t, QColor(250, 244, 238)))
+        rect = QRectF(16, self.PAD + self.D + (33 if hires else 38), self.W - 32, 22)
+        if style == "glossy":
+            font = ui_font(11, QFont.Bold)
+            return rect, font, lambda p, r, t: glossy_text(p, r, t, font)
+        font = ui_font(10.5, QFont.DemiBold)
+        if style == "aero":
+            return rect, font, lambda p, r, t: glow_text(p, r, Qt.AlignCenter, t, QColor(255, 255, 255), QColor(0, 45, 110, 60))
+        color = QColor(255, 250, 240) if style == "snow" else QColor(255, 255, 255, 245)
+        return rect, font, lambda p, r, t: shadow_text(p, r, Qt.AlignCenter, t, color)
+
+    MARQUEE_SPEED = 32.0   # px/s
+    MARQUEE_PAUSE = 1.4    # s at each end
+
+    def _paint_marquee(self, p: QPainter):
+        """A title too long for its space slides to show the rest, pauses, and slides
+        back; the edges fade where text is hidden."""
+        if self._marquee is None:
+            return
+        strip, rect, overflow = self._marquee
+        travel = overflow / self.MARQUEE_SPEED
+        period = 2 * (travel + self.MARQUEE_PAUSE)
+        t = (time.perf_counter() - self._marquee_t0) % period
+        if t < self.MARQUEE_PAUSE:
+            f = 0.0
+        elif t < self.MARQUEE_PAUSE + travel:
+            f = (t - self.MARQUEE_PAUSE) / travel
+        elif t < 2 * self.MARQUEE_PAUSE + travel:
+            f = 1.0
+        else:
+            f = 1.0 - (t - 2 * self.MARQUEE_PAUSE - travel) / travel
+        f = 0.5 - 0.5 * math.cos(math.pi * f)            # ease in and out of each slide
+        offset = f * overflow
+        dpr = self.devicePixelRatioF()
+        box = QImage(round((rect.width() + 8) * dpr), round((rect.height() + 8) * dpr), QImage.Format_ARGB32_Premultiplied)
+        box.setDevicePixelRatio(dpr)
+        box.fill(Qt.transparent)
+        bp = QPainter(box)
+        bp.drawImage(QPointF(4 - offset - 4, 0), strip)
+        fade = QLinearGradient(0, 0, rect.width() + 8, 0)
+        edge = 12 / (rect.width() + 8)
+        fade.setColorAt(0.0, QColor(0, 0, 0, 255 if offset < 1 else 0))
+        fade.setColorAt(edge, QColor(0, 0, 0, 255))
+        fade.setColorAt(1 - edge, QColor(0, 0, 0, 255))
+        fade.setColorAt(1.0, QColor(0, 0, 0, 255 if offset > overflow - 1 else 0))
+        bp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+        bp.fillRect(QRectF(0, 0, rect.width() + 8, rect.height() + 8), fade)
+        bp.end()
+        p.drawImage(QPointF(rect.left() - 4, rect.top() - 4), box)
+        QTimer.singleShot(33, self.update)                # keep it moving even when paused
+
+    def _paint_text(self, p: QPainter):
+        p.drawImage(0, 0, self._text())
+        self._paint_marquee(p)
+
     def _text(self) -> QImage:
         """Title and time; re-rendered only when the words change (about once a second)."""
         pl = self.player
@@ -3727,16 +3886,30 @@ class DiscCard(QWidget):
             p.setFont(hf)
             p.setPen(QColor(235, 235, 240, 110))
             p.drawText(hires_rect, Qt.AlignCenter, "Hi-Res")
+        # the title: drawn here when it fits, otherwise it slides (see _paint_marquee)
+        t_rect, t_font, t_draw = self._title_spec(bool(hires))
+        width = QFontMetricsF(t_font).horizontalAdvance(title)
+        if width > t_rect.width():
+            if self._marquee_title != (title, pl.style):
+                self._marquee_title = (title, pl.style)
+                self._marquee_t0 = time.perf_counter()
+            dpr = self.devicePixelRatioF()
+            strip = QImage(round((width + 8) * dpr), round((t_rect.height() + 8) * dpr), QImage.Format_ARGB32_Premultiplied)
+            strip.setDevicePixelRatio(dpr)
+            strip.fill(Qt.transparent)
+            sp = QPainter(strip)
+            sp.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
+            sp.setFont(t_font)
+            t_draw(sp, QRectF(4, 4, width, t_rect.height()), title)
+            sp.end()
+            self._marquee = (strip, t_rect, width - t_rect.width())
+        else:
+            self._marquee = None
+            self._marquee_title = None
+            p.setFont(t_font)
+            t_draw(p, t_rect, title)
         p.setFont(tf)
-        title = QFontMetrics(tf).elidedText(title, Qt.ElideRight, int(title_rect.width()))
         if pl.style == "turntable":   # the title on the lid, set like a maker's logo
-            lf = ui_font(11.5, QFont.Bold)
-            lf.setLetterSpacing(QFont.AbsoluteSpacing, 2.4)
-            lf.setCapitalization(QFont.AllUppercase)
-            lid = QRectF(24, 38, self.W - 48, 24)
-            p.setFont(lf)
-            shadow_text(p, lid, Qt.AlignCenter, QFontMetrics(lf).elidedText(title, Qt.ElideRight, int(lid.width())),
-                        QColor(250, 244, 238))
             if hires:
                 hf = ui_font(7, QFont.DemiBold)
                 hf.setLetterSpacing(QFont.AbsoluteSpacing, 1.2)
@@ -3749,19 +3922,13 @@ class DiscCard(QWidget):
             self._text_key, self._text_img = key, img
             return img
         if pl.style == "snow":
-            shadow_text(p, title_rect, Qt.AlignCenter, title, QColor(255, 250, 240))
             p.setFont(ui_font(9, QFont.DemiBold))
             shadow_text(p, time_rect, Qt.AlignCenter, t, QColor(255, 216, 120))
             p.end()
             self._text_key, self._text_img = key, img
             return img
         if pl.style == "glossy":
-            glossy_text(p, title_rect, title, ui_font(11, QFont.Bold))
             glossy_text(p, time_rect, t, ui_font(9, QFont.DemiBold), strength=0.82)
-        elif aero:
-            glow_text(p, title_rect, Qt.AlignCenter, title, QColor(255, 255, 255), QColor(0, 45, 110, 60))
-        else:
-            shadow_text(p, title_rect, Qt.AlignCenter, title, QColor(255, 255, 255, 245))
         p.setFont(ui_font(9))
         if aero:
             glow_text(p, time_rect, Qt.AlignCenter, t, QColor(255, 255, 255, 235), QColor(0, 45, 110, 50))
@@ -4051,6 +4218,13 @@ class DiscTrayApp(QObject):
             card.popToggle.connect(self.toggle_popout)
             card.fileDropped.connect(self._on_drop)
         self.panel.deactivated.connect(self._panel_deactivated)
+        self._position_timer = QTimer(self)
+        self._position_timer.setInterval(10_000)
+        self._position_timer.timeout.connect(self._save_position)
+        self._position_timer.start()
+        app = QApplication.instance()
+        app.aboutToQuit.connect(self._save_position)
+        app.commitDataRequest.connect(lambda _m: self._save_position())   # Windows signing out / shutting down
         self.pop.deactivated.connect(self._pop_deactivated)
         self._pop_home: QPoint | None = None
         self._pop_from, self._pop_to = QPointF(), QPointF()
@@ -4172,6 +4346,8 @@ class DiscTrayApp(QObject):
             files = [f for f in self.cfg.get("files") or [self.cfg.get("file")] if f and Path(f).is_file()]
             if files:
                 self.player.load_list(files, index=min(self.cfg.get("index", 0), len(files) - 1), animate=False)
+                if self.cfg.get("position_ms"):   # pick up where the song was when DiscTray closed
+                    self.player.engine.seek(self.cfg["position_ms"])
         if self.cfg.get("popout"):
             self.show_popout()
 
@@ -4513,7 +4689,19 @@ class DiscTrayApp(QObject):
         except OSError:
             self.act_startup.setChecked(startup_enabled())
 
+    def _save_position(self):
+        """Remember the spot in the current song (on quit, on Windows shutdown, and
+        every few seconds while playing in case DiscTray is closed forcefully)."""
+        if not self.player.path:
+            return
+        pos = int(self.player.position())
+        if abs(pos - int(self.cfg.get("position_ms", -10_000))) < 900:
+            return
+        self.cfg["position_ms"] = pos
+        save_config(self.cfg)
+
     def quit(self):
+        self._save_position()
         for card in (self.panel, self.pop, self.hud):
             card.backdrop.stop()
         self.tray.hide()
