@@ -24,7 +24,7 @@ from pathlib import Path
 
 from PySide6.QtCore import (QCoreApplication, QEasingCurve, QEvent, QObject, QPoint, QPointF, QRect, QRectF, Qt, QThread,
                             QTimer, QUrl, QVariantAnimation, Signal)
-from PySide6.QtGui import (QAction, QActionGroup, QColor, QConicalGradient, QCursor, QFont, QFontMetrics, QFontMetricsF, QTransform,
+from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QConicalGradient, QCursor, QFont, QFontMetrics, QFontMetricsF, QTransform,
                            QGuiApplication, QIcon, QImage, QLinearGradient, QPainter,
                            QPainterPath, QPen, QPixmap, QRadialGradient)
 from PySide6.QtMultimedia import QAudio, QAudioDecoder, QAudioFormat, QAudioSink, QMediaDevices
@@ -33,7 +33,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.6.2"
+__version__ = "1.6.3"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
@@ -2520,16 +2520,65 @@ def paint_aero_pill(p: QPainter, rect: QRectF):
     _aero_gloss(p, rect, pill, top=0.5)
 
 
-def paint_aero_disc_gloss(p: QPainter, c: QPointF, r: float):
-    """A glassy dome shine across the top of the record."""
-    disc = QPainterPath()
-    disc.addEllipse(c, r, r)
+def render_aero_dome(px: int) -> QPixmap:
+    """A domed glass cover sealed over the record (it stays put while the record
+    spins under it): cool fresnel tint toward the rim, a big glossy reflection
+    across the top, light pooling in the bottom of the dome, a bevelled rim and
+    a sparkle, like a Vista orb."""
+    pm = QPixmap(px, px)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+    r = px / 2
+    c = QPointF(r, r)
     dome = QPainterPath()
-    dome.addEllipse(QPointF(c.x(), c.y() - r * 0.42), r * 0.86, r * 0.6)
-    g = QLinearGradient(QPointF(c.x(), c.y() - r), QPointF(c.x(), c.y() + r * 0.15))
-    g.setColorAt(0.0, QColor(255, 255, 255, 120))
-    g.setColorAt(1.0, QColor(255, 255, 255, 0))
-    p.fillPath(dome.intersected(disc), g)
+    dome.addEllipse(c, r - 0.5, r - 0.5)
+    p.setPen(Qt.NoPen)
+
+    # the glass itself: clear in the middle, aqua and brighter toward the rim
+    fresnel = QRadialGradient(c, r)
+    fresnel.setColorAt(0.0, QColor(170, 235, 255, 0))
+    fresnel.setColorAt(0.62, QColor(150, 225, 255, 14))
+    fresnel.setColorAt(0.9, QColor(140, 220, 255, 46))
+    fresnel.setColorAt(1.0, QColor(210, 245, 255, 96))
+    p.fillPath(dome, fresnel)
+
+    # light caught in the bottom of the dome
+    pool = QRadialGradient(QPointF(r, r * 1.78), r * 0.95)
+    pool.setColorAt(0.0, QColor(150, 240, 255, 120))
+    pool.setColorAt(0.5, QColor(90, 200, 255, 48))
+    pool.setColorAt(1.0, QColor(60, 170, 255, 0))
+    p.fillPath(dome, pool)
+
+    # the big reflection: an ellipse over the top half with a soft lower edge
+    hi = QRectF(r * 0.2, r * 0.07, r * 1.6, r * 0.98)
+    shine = QPainterPath()
+    shine.addEllipse(hi)
+    g = QLinearGradient(hi.topLeft(), hi.bottomLeft())
+    g.setColorAt(0.0, QColor(255, 255, 255, 205))
+    g.setColorAt(0.45, QColor(255, 255, 255, 92))
+    g.setColorAt(1.0, QColor(255, 255, 255, 6))
+    p.fillPath(shine.intersected(dome), g)
+
+    # sparkle near the top left
+    spark = QRadialGradient(QPointF(r * 0.56, r * 0.42), r * 0.13)
+    spark.setColorAt(0.0, QColor(255, 255, 255, 235))
+    spark.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.setBrush(spark)
+    p.drawEllipse(QPointF(r * 0.56, r * 0.42), r * 0.13, r * 0.09)
+
+    # bevel: a dark seal on the outside, a bright lip just inside it
+    p.setBrush(Qt.NoBrush)
+    p.setPen(QPen(QColor(10, 60, 120, 150), max(1.0, px / 160)))
+    p.drawEllipse(c, r - 0.8, r - 0.8)
+    lip = QLinearGradient(0, 0, 0, px)
+    lip.setColorAt(0.0, QColor(255, 255, 255, 230))
+    lip.setColorAt(0.5, QColor(200, 240, 255, 90))
+    lip.setColorAt(1.0, QColor(170, 235, 255, 200))
+    p.setPen(QPen(QBrush(lip), max(1.0, px / 130)))
+    p.drawEllipse(c, r - px / 80, r - px / 80)
+    p.end()
+    return pm
 
 
 def glow_text(p: QPainter, rect: QRectF, flags, text: str, color: QColor, glow: QColor):
@@ -2592,6 +2641,7 @@ class DiscCard(QWidget):
         self.setFixedSize(self.W, self.H)
         self.setWindowTitle(APP_NAME)
         self._aero_bg: QPixmap | None = None
+        self._aero_dome: dict[int, QPixmap] = {}
         self._glide = QTimer(self)        # eases the pop-out toward the cursor while dragging
         self._glide.setTimerType(Qt.PreciseTimer)
         self._glide.setInterval(7)
@@ -3508,8 +3558,11 @@ class DiscCard(QWidget):
         p.restore()
         sheen_pm = pl.sheen_pixmap(px)
         p.drawPixmap(target, sheen_pm, QRectF(sheen_pm.rect()))
-        if pl.style == "aero":
-            paint_aero_disc_gloss(p, QPointF(0, 0), R)
+        if pl.style == "aero":   # sealed under a glossy glass dome that doesn't turn
+            dome = self._aero_dome.get(px)
+            if dome is None:
+                dome = self._aero_dome[px] = render_aero_dome(px)
+            p.drawPixmap(target, dome, QRectF(dome.rect()))
         if (self._hover_disc or not pl.want_playing) and pl.path and self._scrub is None:
             self._paint_hub_glyph(p, R * LENS_R, playing=pl.want_playing)
         self._paint_scrub_ring(p, R)
