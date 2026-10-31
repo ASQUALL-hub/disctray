@@ -23,9 +23,9 @@ A tray-only music player for Windows. Drop an audio file on its tray icon and it
 - **Styles** (tray menu → Style):
   - **Glassy:** Liquid Glass-style squircles with live blur and edge refraction.
   - **Glossy Glass:** a glass record and glossy lettering.
-  - **Frutiger Aero:** the record spins sealed under a glossy glass dome.
+  - **Frutiger Aero.**
   - **Snow Globe:** snow with physics. Shake the pop-out!
-  - **Liquid:** clear water that sloshes (real shallow-water physics), throws droplets that cling to the glass and run down, and fills with bubbles when shaken hard.
+  - **Liquid:** the record sits sealed under a glossy glass cover that's a little humid inside (mist at the edges, condensation beaded on the glass), in clear water that sloshes (real shallow-water physics), throws droplets that cling to the glass and run down, and fills with bubbles when shaken hard.
   - **Record Player:** a suitcase turntable whose tonearm swings onto the record when you press play and follows the groove inward as the song plays.
 
 ## Install

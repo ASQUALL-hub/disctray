@@ -33,7 +33,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.6.3"
+__version__ = "1.6.4"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
@@ -2520,11 +2520,45 @@ def paint_aero_pill(p: QPainter, rect: QRectF):
     _aero_gloss(p, rect, pill, top=0.5)
 
 
-def render_aero_dome(px: int) -> QPixmap:
-    """A domed glass cover sealed over the record (it stays put while the record
-    spins under it): cool fresnel tint toward the rim, a big glossy reflection
-    across the top, light pooling in the bottom of the dome, a bevelled rim and
-    a sparkle, like a Vista orb."""
+def paint_aero_disc_gloss(p: QPainter, c: QPointF, r: float):
+    """A glassy dome shine across the top of the record."""
+    disc = QPainterPath()
+    disc.addEllipse(c, r, r)
+    dome = QPainterPath()
+    dome.addEllipse(QPointF(c.x(), c.y() - r * 0.42), r * 0.86, r * 0.6)
+    g = QLinearGradient(QPointF(c.x(), c.y() - r), QPointF(c.x(), c.y() + r * 0.15))
+    g.setColorAt(0.0, QColor(255, 255, 255, 120))
+    g.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.fillPath(dome.intersected(disc), g)
+
+
+def _paint_bead(p: QPainter, x: float, y: float, d: float):
+    """One drop of condensation, like the iOS water-drops wallpaper: a clear lens
+    with a crisp dark rim (heaviest underneath), light gathered in its bottom and
+    a glint up top."""
+    body = QLinearGradient(x, y - d, x, y + d)
+    body.setColorAt(0.0, QColor(30, 52, 58, 80))
+    body.setColorAt(0.55, QColor(190, 222, 228, 34))
+    body.setColorAt(1.0, QColor(255, 255, 255, 150))
+    p.setPen(Qt.NoPen)
+    p.setBrush(body)
+    p.drawEllipse(QPointF(x, y), d, d)
+    rim = QRectF(x - d, y - d, 2 * d, 2 * d)
+    p.setBrush(Qt.NoBrush)
+    p.setPen(QPen(QColor(12, 24, 28, 140), max(0.6, d * 0.16)))
+    p.drawEllipse(rim)
+    p.setPen(QPen(QColor(8, 16, 20, 110), max(0.8, d * 0.3), Qt.SolidLine, Qt.RoundCap))
+    p.drawArc(rim.adjusted(d * 0.08, d * 0.08, -d * 0.08, -d * 0.08), 200 * 16, 140 * 16)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(255, 255, 255, 235))
+    p.drawEllipse(QPointF(x - d * 0.32, y - d * 0.42), d * 0.26, d * 0.18)
+
+
+def render_humid_dome(px: int) -> QPixmap:
+    """The Liquid style's glass cover over the record (it stays put while the record
+    spins under it): teal-to-grey glass like the iOS water-drops wallpaper, a little
+    humid inside (mist at the cooler rim and bottom, condensation beaded on the glass,
+    a few drops that ran and wiped trails), and a strong gloss on the outside."""
     pm = QPixmap(px, px)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
@@ -2535,46 +2569,100 @@ def render_aero_dome(px: int) -> QPixmap:
     dome.addEllipse(c, r - 0.5, r - 0.5)
     p.setPen(Qt.NoPen)
 
-    # the glass itself: clear in the middle, aqua and brighter toward the rim
+    # the glass: clear in the middle, teal at the top fading to grey, brighter at the rim
     fresnel = QRadialGradient(c, r)
-    fresnel.setColorAt(0.0, QColor(170, 235, 255, 0))
-    fresnel.setColorAt(0.62, QColor(150, 225, 255, 14))
-    fresnel.setColorAt(0.9, QColor(140, 220, 255, 46))
-    fresnel.setColorAt(1.0, QColor(210, 245, 255, 96))
+    fresnel.setColorAt(0.0, QColor(200, 230, 232, 0))
+    fresnel.setColorAt(0.62, QColor(190, 225, 230, 12))
+    fresnel.setColorAt(0.9, QColor(185, 222, 228, 42))
+    fresnel.setColorAt(1.0, QColor(235, 248, 250, 92))
     p.fillPath(dome, fresnel)
+    tint = QLinearGradient(0, 0, 0, px)
+    tint.setColorAt(0.0, QColor(70, 175, 185, 52))
+    tint.setColorAt(0.45, QColor(200, 210, 214, 18))
+    tint.setColorAt(1.0, QColor(150, 155, 160, 30))
+    p.fillPath(dome, tint)
 
-    # light caught in the bottom of the dome
-    pool = QRadialGradient(QPointF(r, r * 1.78), r * 0.95)
-    pool.setColorAt(0.0, QColor(150, 240, 255, 120))
-    pool.setColorAt(0.5, QColor(90, 200, 255, 48))
-    pool.setColorAt(1.0, QColor(60, 170, 255, 0))
-    p.fillPath(dome, pool)
+    # humid inside: mist on the cooler rim and bottom, beaded condensation,
+    # and a few drops that ran down and wiped trails through the mist
+    fog = QPixmap(px, px)
+    fog.fill(Qt.transparent)
+    fp = QPainter(fog)
+    fp.setRenderHint(QPainter.Antialiasing)
+    fp.setPen(Qt.NoPen)
+    mist = QRadialGradient(QPointF(r, r * 1.08), r * 1.02)
+    mist.setColorAt(0.0, QColor(240, 248, 250, 0))
+    mist.setColorAt(0.5, QColor(240, 248, 250, 10))
+    mist.setColorAt(0.82, QColor(240, 248, 250, 50))
+    mist.setColorAt(1.0, QColor(248, 252, 253, 92))
+    fp.fillPath(dome, mist)
+    low = QLinearGradient(0, r * 0.9, 0, px)
+    low.setColorAt(0.0, QColor(240, 248, 250, 0))
+    low.setColorAt(1.0, QColor(240, 248, 250, 44))
+    fp.fillPath(dome, low)
+    rng = random.Random(262)
+    runs = []
+    for _ in range(int(px * 1.4)):
+        a = rng.uniform(0, 2 * math.pi)
+        if rng.random() > 0.5 + 0.45 * math.sin(a):   # more toward the bottom (y grows downward)
+            continue
+        dist = r * (0.42 + 0.54 * rng.random() ** 0.55)   # denser toward the rim
+        x, y = r + dist * math.cos(a), r + dist * math.sin(a)
+        d = px * (0.003 + 0.012 * rng.random() ** 3.0)   # mostly tiny, a few bigger beads
+        if d < px * 0.0048:   # pinpricks: a dark speck with a light centre
+            fp.setBrush(QColor(12, 24, 28, rng.randint(60, 110)))
+            fp.drawEllipse(QPointF(x, y), d, d)
+            fp.setBrush(QColor(255, 255, 255, rng.randint(90, 160)))
+            fp.drawEllipse(QPointF(x, y + d * 0.2), d * 0.5, d * 0.5)
+            continue
+        _paint_bead(fp, x, y, d)
+        if d > px * 0.0105 and len(runs) < 4 and abs(math.cos(a)) > 0.35:
+            runs.append((x, y, d))
+    fp.setCompositionMode(QPainter.CompositionMode_DestinationOut)
+    for x, y, d in runs:
+        trail = QLinearGradient(x, y - d * 9, x, y)
+        trail.setColorAt(0.0, QColor(0, 0, 0, 0))
+        trail.setColorAt(1.0, QColor(0, 0, 0, 200))
+        fp.setPen(QPen(QBrush(trail), d * 1.1, Qt.SolidLine, Qt.RoundCap))
+        fp.drawLine(QPointF(x + rng.uniform(-d, d), y - d * 9), QPointF(x, y - d * 0.6))
+    fp.end()
+    p.drawPixmap(0, 0, fog)
 
-    # the big reflection: an ellipse over the top half with a soft lower edge
+    # the big reflection on the outside: an ellipse over the top half with a soft lower edge
     hi = QRectF(r * 0.2, r * 0.07, r * 1.6, r * 0.98)
     shine = QPainterPath()
     shine.addEllipse(hi)
     g = QLinearGradient(hi.topLeft(), hi.bottomLeft())
-    g.setColorAt(0.0, QColor(255, 255, 255, 205))
-    g.setColorAt(0.45, QColor(255, 255, 255, 92))
-    g.setColorAt(1.0, QColor(255, 255, 255, 6))
+    g.setColorAt(0.0, QColor(255, 255, 255, 235))
+    g.setColorAt(0.4, QColor(255, 255, 255, 120))
+    g.setColorAt(1.0, QColor(255, 255, 255, 8))
     p.fillPath(shine.intersected(dome), g)
+
+    # a second, thinner reflection hugging the bottom of the glass
+    arc = QPainterPath()
+    arc.addEllipse(QRectF(r * 0.22, r * 1.38, r * 1.56, r * 0.56))
+    inner = QPainterPath()
+    inner.addEllipse(QRectF(r * 0.3, r * 1.3, r * 1.4, r * 0.56))
+    bg = QLinearGradient(0, r * 1.5, 0, r * 1.94)
+    bg.setColorAt(0.0, QColor(255, 255, 255, 0))
+    bg.setColorAt(1.0, QColor(255, 255, 255, 120))
+    p.fillPath(arc.subtracted(inner).intersected(dome), bg)
 
     # sparkle near the top left
     spark = QRadialGradient(QPointF(r * 0.56, r * 0.42), r * 0.13)
     spark.setColorAt(0.0, QColor(255, 255, 255, 235))
     spark.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.setPen(Qt.NoPen)
     p.setBrush(spark)
     p.drawEllipse(QPointF(r * 0.56, r * 0.42), r * 0.13, r * 0.09)
 
     # bevel: a dark seal on the outside, a bright lip just inside it
     p.setBrush(Qt.NoBrush)
-    p.setPen(QPen(QColor(10, 60, 120, 150), max(1.0, px / 160)))
+    p.setPen(QPen(QColor(16, 40, 46, 150), max(1.0, px / 160)))
     p.drawEllipse(c, r - 0.8, r - 0.8)
     lip = QLinearGradient(0, 0, 0, px)
     lip.setColorAt(0.0, QColor(255, 255, 255, 230))
-    lip.setColorAt(0.5, QColor(200, 240, 255, 90))
-    lip.setColorAt(1.0, QColor(170, 235, 255, 200))
+    lip.setColorAt(0.5, QColor(215, 235, 238, 90))
+    lip.setColorAt(1.0, QColor(200, 230, 234, 200))
     p.setPen(QPen(QBrush(lip), max(1.0, px / 130)))
     p.drawEllipse(c, r - px / 80, r - px / 80)
     p.end()
@@ -2641,7 +2729,7 @@ class DiscCard(QWidget):
         self.setFixedSize(self.W, self.H)
         self.setWindowTitle(APP_NAME)
         self._aero_bg: QPixmap | None = None
-        self._aero_dome: dict[int, QPixmap] = {}
+        self._dome: dict[int, QPixmap] = {}   # Liquid's glass cover, per pixel size
         self._glide = QTimer(self)        # eases the pop-out toward the cursor while dragging
         self._glide.setTimerType(Qt.PreciseTimer)
         self._glide.setInterval(7)
@@ -3558,10 +3646,12 @@ class DiscCard(QWidget):
         p.restore()
         sheen_pm = pl.sheen_pixmap(px)
         p.drawPixmap(target, sheen_pm, QRectF(sheen_pm.rect()))
-        if pl.style == "aero":   # sealed under a glossy glass dome that doesn't turn
-            dome = self._aero_dome.get(px)
+        if pl.style == "aero":
+            paint_aero_disc_gloss(p, QPointF(0, 0), R)
+        elif pl.style == "liquid":   # sealed under a humid glass cover that doesn't turn
+            dome = self._dome.get(px)
             if dome is None:
-                dome = self._aero_dome[px] = render_aero_dome(px)
+                dome = self._dome[px] = render_humid_dome(px)
             p.drawPixmap(target, dome, QRectF(dome.rect()))
         if (self._hover_disc or not pl.want_playing) and pl.path and self._scrub is None:
             self._paint_hub_glyph(p, R * LENS_R, playing=pl.want_playing)
