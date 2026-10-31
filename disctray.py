@@ -30,10 +30,11 @@ from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QConicalGradie
 from PySide6.QtMultimedia import QAudio, QAudioDecoder, QAudioFormat, QAudioSink, QMediaDevices
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 import numpy as np
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
@@ -229,6 +230,11 @@ gdi32.SetStretchBltMode.argtypes = [wt.HDC, ctypes.c_int]
 gdi32.SetBrushOrgEx.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
 ctypes.windll.kernel32.GetTickCount.restype = wt.DWORD
 SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 76, 77, 78, 79
+
+
+def last_input_tick() -> int:
+    li = LASTINPUTINFO(ctypes.sizeof(LASTINPUTINFO), 0)
+    return int(li.dwTime) if user32.GetLastInputInfo(ctypes.byref(li)) else 0
 
 
 def idle_seconds() -> float:
@@ -2151,7 +2157,11 @@ class WaterSim:
     JET_H, JET_T, JET_W = 80.0, 0.08, 2.6
     CLING_START = 26      # drops of condensation on the glass at the start
     CONDENSE = 0.0        # new drops forming on the glass per second
-    SLIDE_R = 2.4         # drops at least this big run down the glass
+    RAIN = 0.0            # bigger drops landing on the glass per second
+    SLIDE_R = 2.4         # drops at least this big run down the glass...
+    SLIDE_SPEED = 22.0    # ...this much faster per px of radius over SLIDE_R
+    SPRAY_N, SPRAY_V = 5, 380.0   # drops a bass kick throws up, and how hard (px/s)
+    SPLASH_GLASS = 0.8    # chance per second that a flying drop hits the glass in front and sticks
 
     def __init__(self, width: float, height: float, level_y: float, seed: int = 3):
         self.rng = np.random.default_rng(seed)
@@ -2192,6 +2202,17 @@ class WaterSim:
         if s <= 0:
             return
         self._jets.append([float(x), s, 0.0])
+        self._throw(x, int(self.SPRAY_N * min(s, 1.5) + 0.5), self.SPRAY_V * math.sqrt(s))
+
+    def _throw(self, x: float, k: int, v: float):
+        """Spray thrown up out of the water at x."""
+        k = min(k, self.MAX_FLYING - len(self.flying))
+        if k <= 0:
+            return
+        rng = self.rng
+        drops = np.stack([x + rng.normal(0, 1.5 * self.dx, k), np.full(k, float(self.surface_at(x)) - 2),
+                          rng.normal(0, 0.2 * v, k), -v * rng.uniform(0.6, 1.15, k), rng.uniform(0.9, 2.3, k)], axis=1)
+        self.flying = np.vstack([self.flying, drops])
 
     def _step_jets(self, dt: float):
         for jet in self._jets:
@@ -2288,6 +2309,9 @@ class WaterSim:
             if y >= self.surface_at(x) and vy > 0:          # back into the water
                 keep[i] = False
                 self._dip(x, 0.08 * r)
+            elif self.SPLASH_GLASS and self.rng.random() < self.SPLASH_GLASS * dt:   # splashed onto the glass
+                keep[i] = False
+                stick.append([min(max(x, r + 2), self.W - r - 2), max(y, r + 2), r * 1.4, 0.0])
             elif x < r + 2 or x > self.W - r - 2 or y < r + 2:  # hit the glass: it clings
                 keep[i] = False
                 stick.append([min(max(x, r + 2), self.W - r - 2), max(y, r + 2), r, 0.0])
@@ -2321,11 +2345,18 @@ class WaterSim:
                 x = rng.uniform(4, self.W - 4, k)
                 y = rng.uniform(4, np.maximum(6, self.surface_at(x) - 10))
                 c = np.vstack([c, np.stack([x, y, rng.uniform(0.8, 1.6, k), np.zeros(k)], axis=1)])
+        if self.RAIN and len(c) < self.MAX_CLING:   # and now and then a real drop lands on it
+            k = min(self.MAX_CLING - len(c), int(rng.poisson(self.RAIN * dt)))
+            if k:
+                x = rng.uniform(6, self.W - 6, k)
+                y = rng.uniform(4, np.maximum(6, self.surface_at(x) - 14))
+                r = np.clip(1.2 + rng.gamma(2.0, 0.8, k), 1.2, 5.0)
+                c = np.vstack([c, np.stack([x, y, r, np.zeros(k)], axis=1)])
         # heavy drops run down in fits and starts, leaving tiny droplets behind
         slide = self.SLIDE_R
         big = c[:, 2] > slide
         start = big & (c[:, 3] == 0) & (rng.random(len(c)) < 0.8 * dt * (c[:, 2] - slide))
-        c[start, 3] = (c[start, 2] - slide) * 22 + 6
+        c[start, 3] = (c[start, 2] - slide) * self.SLIDE_SPEED + 6
         stop = (c[:, 3] > 0) & (rng.random(len(c)) < dt * 1.2)
         c[stop, 3] = 0
         c[:, 1] += c[:, 3] * dt
@@ -2361,10 +2392,80 @@ class SeaSim(WaterSim):
     screen), with more room for spray, bubbles and drops on the glass, and big heaves."""
 
     N = 160
-    MAX_FLYING, MAX_CLING, MAX_BUBBLES = 320, 520, 160
+    MAX_FLYING, MAX_CLING, MAX_BUBBLES = 320, 620, 160
     JET_H, JET_T, JET_W = 130.0, 0.1, 3.4
     FRICTION = 1.5        # calmer than the card, so the beats don't pile up into chaos
-    CLING_START, CONDENSE, SLIDE_R = 300, 26.0, 1.9   # a wet screen, like the wallpaper
+    # a wet screen like the wallpaper: lots of drops, more forming and landing, the heavy ones running down
+    CLING_START, CONDENSE, RAIN, SLIDE_R, SLIDE_SPEED = 380, 18.0, 2.5, 4.6, 34.0
+    SPRAY_N, SPRAY_V, SPLASH_GLASS = 8, 520.0, 1.6
+
+    def __init__(self, width: float, height: float, level_y: float, seed: int = 3):
+        super().__init__(width, height, level_y, seed)
+        rng, n = self.rng, self.CLING_START
+        x = rng.uniform(4, self.W - 4, n)
+        y = rng.uniform(4, level_y - 14, n)
+        top = 1 - y / level_y
+        r = np.clip(0.6 + rng.gamma(1.3, 0.55, n) * (0.6 + 1.6 * top ** 2), 0.6, 7.5)   # bigger up top, like the wallpaper
+        self.cling = np.stack([x, y, r, np.zeros(n)], axis=1)
+
+
+WALLPAPER_SKY = ((0.0, (121, 174, 182)), (0.05, (112, 172, 181)), (0.12, (148, 181, 186)), (0.2, (175, 188, 190)),
+                 (0.3, (191, 191, 193)), (0.5, (189, 189, 191)), (0.6, (170, 170, 171)), (0.7, (143, 143, 144)),
+                 (0.8, (113, 113, 113)), (0.9, (83, 83, 83)), (1.0, (53, 53, 53)))   # sampled from the iOS water-drops wallpaper
+
+
+def glass_drop_sprite(r: float, variant: int) -> QPixmap:
+    """A drop on a window, after the iOS water-drops wallpaper: clear inside, a thick
+    dark rim (heaviest low on the left) that turns into a bright glint at the top
+    right, and light focused into a bright spot inside the bottom edge. Slightly
+    irregular, as real drops are. r in px."""
+    rng = random.Random(variant * 7919 + int(r * 10))
+    d = int(math.ceil(2 * r + 6))
+    img = QImage(d * 2, d * 2, QImage.Format_ARGB32_Premultiplied)
+    img.setDevicePixelRatio(2.0)
+    img.fill(Qt.transparent)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.translate(d / 2, d / 2)
+    rx, ry = r * rng.uniform(0.95, 1.06), r * rng.uniform(0.85, 0.97)
+    p.rotate(rng.uniform(-25, 25))
+    oval = QRectF(-rx, -ry, 2 * rx, 2 * ry)
+    if r < 2.6:   # specks: a dark ring around a bright point
+        p.setPen(QPen(QColor(12, 22, 26, 170), max(0.7, r * 0.45)))
+        p.setBrush(QColor(255, 255, 255, 30))
+        p.drawEllipse(oval)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 210))
+        p.drawEllipse(QPointF(0, ry * 0.4), r * 0.35, r * 0.3)
+        p.end()
+        return QPixmap.fromImage(img)
+    body = QLinearGradient(0, -ry, 0, ry)
+    body.setColorAt(0.0, QColor(0, 20, 26, 26))
+    body.setColorAt(0.6, QColor(255, 255, 255, 14))
+    body.setColorAt(1.0, QColor(255, 255, 255, 46))
+    p.setPen(Qt.NoPen)
+    p.setBrush(body)
+    p.drawEllipse(oval)
+    p.setBrush(Qt.NoBrush)
+    inset = max(0.45, r * 0.06)
+    p.setPen(QPen(QColor(8, 20, 24, 215), max(0.9, r * 0.12)))
+    p.drawEllipse(oval.adjusted(inset, inset, -inset, -inset))
+    p.setPen(QPen(QColor(4, 14, 18, 235), max(1.2, r * 0.22), Qt.SolidLine, Qt.RoundCap))
+    p.drawArc(oval.adjusted(r * 0.1, r * 0.1, -r * 0.1, -r * 0.1), 150 * 16, 140 * 16)   # heavier low on the left
+    p.setPen(QPen(QColor(255, 255, 255, 215), max(0.8, r * 0.1), Qt.SolidLine, Qt.RoundCap))
+    p.drawArc(oval.adjusted(r * 0.08, r * 0.08, -r * 0.08, -r * 0.08), 20 * 16, 50 * 16)   # rim catching the light
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(255, 255, 255, 240))
+    p.drawEllipse(QPointF(rx * 0.6, -ry * 0.62), r * 0.12, r * 0.09)
+    focus = QRadialGradient(QPointF(rx * 0.05, ry * 0.68), r * 0.34)
+    focus.setColorAt(0.0, QColor(255, 255, 255, 245))
+    focus.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.setBrush(focus)
+    p.drawEllipse(QPointF(rx * 0.05, ry * 0.68), r * 0.36, r * 0.21)
+    p.setBrush(QColor(255, 255, 255, 170))
+    p.drawEllipse(QPointF(-rx * 0.12, ry * 0.08), r * 0.06, r * 0.05)
+    p.end()
+    return QPixmap.fromImage(img)
 
 
 def drop_sprite(r: float, kind: str) -> QPixmap:
@@ -4657,7 +4758,7 @@ SAVER_STILL_S = 15.0    # ...and nothing moving on screen for this long: start t
 SAVER_SCENES = {"glossy": "Glossy Glass lights", "sea": "Sea"}
 
 
-class Screensaver(QWidget):
+class Screensaver(QOpenGLWidget):
     """Fullscreen view of what's playing, for when the PC sits idle. Nothing on it
     stays put, so nothing burns in: the record and title drift slowly around the
     screen and the light (Glossy Glass) or the sea (Liquid) never repeats. Both
@@ -4674,27 +4775,38 @@ class Screensaver(QWidget):
     def __init__(self, player: "Player", scene: str, screen):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.player, self.scene = player, scene
-        self.setAttribute(Qt.WA_OpaquePaintEvent)
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.setCursor(Qt.BlankCursor)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setWindowTitle(f"{APP_NAME} screensaver")
-        self.setGeometry(screen.geometry())
+        # one pixel taller than the screen: an OpenGL window that exactly covers it gets
+        # Windows' fullscreen "direct flip", which screenshots and recorders can't see
+        self.setGeometry(screen.geometry().adjusted(0, 0, 0, 1))
         rng = random.Random()
         self._rng = rng
         self._seed = rng.uniform(0, 100)
         self._t0 = self._last = time.perf_counter()
         self._armed = False
         self._cursor = QCursor.pos()
+        self._input = 0
         self._bass_seen = self._t0
         self._pulse = 0.0                       # flares up on a bass kick, then fades
         self._discs: dict = {}
         self._sprites: dict = {}
+        self._atm: QImage | None = None         # the sea's sky and underwater light, computed small and scaled up
+        self._atm_buf: np.ndarray | None = None
+        self._under: QImage | None = None
+        self._under_buf: np.ndarray | None = None
+        self._under_top = 0.0
+        self._atm_base: np.ndarray | None = None
+        self._orbs = [(rng.random(), rng.random(), rng.uniform(0.05, 0.13), rng.uniform(0.05, 0.16), rng.uniform(0, 6.3),
+                       rng.choice(((0.8, 0.95, 1.0), (1.0, 1.0, 1.0), (0.6, 0.9, 0.95))))
+                      for _ in range(13)]                  # out-of-focus lights behind the glass
+        self._motes = [(rng.random(), rng.random(), rng.uniform(0.6, 1.8), rng.uniform(0, 6.3)) for _ in range(70)]
         self._aurora: QImage | None = None      # the light show, computed small and scaled up
         self._aurora_buf: np.ndarray | None = None
         self._frames = 0
         self._sky: QPixmap | None = None
-        self._sky_t = -1e9
         self._stars = [(rng.random(), rng.random() * 0.9, rng.uniform(0.6, 1.8), rng.uniform(0, 6.3), rng.uniform(0.5, 1.6))
                        for _ in range(140)]
         self.sim: SeaSim | None = None
@@ -4739,10 +4851,17 @@ class Screensaver(QWidget):
         self._last = now
         if not self._armed:
             if now - self._t0 >= self.ARM_S:
-                self._armed, self._cursor = True, QCursor.pos()
-        elif (QCursor.pos() - self._cursor).manhattanLength() > 12 or any_mouse_button_down() or any_key_down():
-            self.exited.emit()
-            return
+                self._armed, self._cursor, self._input = True, QCursor.pos(), last_input_tick()
+        else:
+            moved = (QCursor.pos() - self._cursor).manhattanLength()
+            tick = last_input_tick()
+            if tick != self._input and moved <= 2:   # input without the mouse moving: a key, click or wheel
+                self.exited.emit()
+                return
+            if moved > 12 or any_mouse_button_down() or any_key_down():
+                self.exited.emit()
+                return
+            self._input = tick   # a nudge of a few pixels doesn't count
         for s in self.player.engine.bass_hits(self._bass_seen):
             self._pulse = max(self._pulse, s)
             if self.sim is not None:   # the sea's "speaker": the water heaves up on the bass
@@ -4866,7 +4985,7 @@ class Screensaver(QWidget):
         w = pm.width() / pm.devicePixelRatio()
         p.drawPixmap(QPointF(x - w / 2, y - w / 2), pm)
 
-    def paintEvent(self, _):
+    def paintGL(self):   # a QOpenGLWidget: the same painting, done by the graphics card
         p = QPainter(self)
         p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
         t = time.perf_counter() - self._t0
@@ -4928,38 +5047,91 @@ class Screensaver(QWidget):
         self._paint_panel(p, panel, glossy=True)
 
     # --- Liquid: a sea that sloshes, swells and heaves to the bass, the record turning above it
-    def _sky_pixmap(self, t: float) -> QPixmap:
-        if self._sky is None or t - self._sky_t > 3.0:   # drifts slowly, so redrawn now and then
-            W, H = self.width(), self.height()
-            pm = QPixmap(W, H)
-            sp = QPainter(pm)
-            shift = 0.04 * math.sin(t / 60 + self._seed)
-            g = QLinearGradient(0, 0, 0, H)
-            g.setColorAt(0.0, QColor.fromHsvF((0.51 + shift) % 1.0, 0.62, 0.7))
-            g.setColorAt(0.3, QColor.fromHsvF((0.52 + shift) % 1.0, 0.18, 0.82))
-            g.setColorAt(0.6, QColor.fromHsvF((0.55 + shift) % 1.0, 0.05, 0.72))
-            g.setColorAt(1.0, QColor.fromHsvF((0.55 + shift) % 1.0, 0.06, 0.28))
-            sp.fillRect(0, 0, W, H, g)
-            glow = QRadialGradient(QPointF(W * (0.5 + 0.3 * math.sin(t / 90 + self._seed)), H * 0.08), W * 0.45)
-            glow.setColorAt(0.0, QColor(255, 255, 255, 70))
-            glow.setColorAt(1.0, QColor(255, 255, 255, 0))
-            sp.fillRect(0, 0, W, H, glow)
-            sp.end()
-            self._sky, self._sky_t = pm, t
-        return self._sky
+    def _atmosphere(self, t: float, centre: QPointF, R: float) -> QImage:
+        """Above the water, behind the glass: the wallpaper's teal-to-grey, out-of-focus
+        lights drifting about, a glossy sheen sweeping across now and then, and a glow
+        behind the record that breathes with the bass. Computed small, scaled up."""
+        W, H = self.width(), self.height()
+        lw, lh = max(32, W // 6), max(18, H // 6)
+        if self._atm_base is None or self._atm_base.shape[:2] != (lh, lw):
+            ys = np.linspace(0, 1, lh)
+            stops = np.array([a for a, _ in WALLPAPER_SKY])
+            cols = np.array([c for _, c in WALLPAPER_SKY], np.float32) / 255
+            grad = np.stack([np.interp(ys, stops, cols[:, k]) for k in range(3)], axis=1).astype(np.float32)
+            self._atm_base = np.repeat(grad[:, None, :], lw, axis=1)
+            self._gx = np.arange(lw, dtype=np.float32)[None, :]
+            self._gy = np.arange(lh, dtype=np.float32)[:, None]
+        img = self._atm_base.copy()
+        bass = self.player.engine.bass_level()
+        gx, gy = self._gx, self._gy
+        pos = (t / 28.0) % 1.8 - 0.4                        # a sheen glides across the glass, then rests
+        band = np.exp(-(((gx / lw) * 0.8 + (gy / lh) * 0.55 - pos * 1.35) / 0.08) ** 2) * 0.08
+        img += band[:, :, None]
+        cx, cy, rr = centre.x() / 6, centre.y() / 6, R / 6
+        halo = np.exp(-((gx - cx) ** 2 + (gy - cy) ** 2) / (2 * (rr * 1.1) ** 2)) * (0.1 + 0.22 * bass + 0.3 * self._pulse)
+        img += halo[:, :, None] * np.array([0.75, 0.97, 1.0], np.float32)
+        for fx, fy, fr, speed, ph, tint in self._orbs:      # bokeh: soft discs with a brighter rim
+            x = (fx + 0.04 * math.sin(t * speed + ph)) * lw
+            y = (fy * 0.55 + 0.03 * math.sin(t * speed * 0.7 + ph)) * lh
+            r = fr * lh * (1 + 0.1 * self._pulse)
+            x0, x1, y0, y1 = int(max(0, x - r - 1)), int(min(lw, x + r + 2)), int(max(0, y - r - 1)), int(min(lh, y + r + 2))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            dd = np.sqrt((gx[:, x0:x1] - x) ** 2 + (gy[y0:y1] - y) ** 2) / r
+            disc = np.clip((1 - dd) * 5, 0, 1) * (0.55 + 0.45 * np.clip(dd, 0, 1))
+            a = 0.09 + 0.04 * math.sin(t * 0.5 + ph) + 0.1 * self._pulse
+            img[y0:y1, x0:x1] += disc[:, :, None] * a * np.array(tint, np.float32)
+        self._atm_buf = np.ascontiguousarray((np.clip(img, 0, 1) * 255).astype(np.uint8))
+        return QImage(self._atm_buf.data, lw, lh, 3 * lw, QImage.Format_RGB888)
+
+    def _underwater(self, t: float, surface: np.ndarray) -> QImage:
+        """Light in the water, added on top of it: shafts slanting down from the surface
+        and caustics shimmering just under it, brighter on the bass. `surface` is the
+        water line (screen px) for each low-res column."""
+        W, H = self.width(), self.height()
+        lw, lh = max(32, W // 6), max(18, H // 6)
+        top = max(0, int(surface.min() / 6) - 1)
+        X = np.arange(lw, dtype=np.float32)[None, :] * 6
+        Y = np.arange(top, lh, dtype=np.float32)[:, None] * 6
+        depth = Y - surface[None, :]
+        xs = X + 0.35 * depth
+        rays = ((0.5 + 0.5 * np.sin(xs / 57 + t * 0.4)) * (0.5 + 0.5 * np.sin(xs / 23 - t * 0.27 + 1.3))) ** 3
+        rays *= np.exp(-np.maximum(depth, 0) / (H * 0.35))
+        c = (np.sin(X / 37 + t * 0.9 + 1.7 * np.sin(Y / 53 - t * 0.5)) + np.sin(Y / 31 - t * 0.7 + 1.5 * np.sin(X / 61 + t * 0.35))
+             + 0.6 * np.sin((X + Y) / 43 + t * 0.6))
+        caus = np.clip(1 - np.abs(c) * 1.6, 0, 1) ** 6 * np.exp(-np.maximum(depth, 0) / (H * 0.09))
+        light = (rays * 0.2 + caus * 0.16) * (1 + 0.9 * self._pulse + 0.4 * self.player.engine.bass_level())
+        light *= np.clip(depth / 6, 0, 1)                 # nothing above the surface
+        rgb = light[:, :, None] * np.array([0.72, 0.95, 1.0], np.float32)
+        self._under_buf = np.ascontiguousarray((np.clip(rgb, 0, 1) * 255).astype(np.uint8))
+        self._under_top = top * 6.0
+        return QImage(self._under_buf.data, lw, lh - top, 3 * lw, QImage.Format_RGB888)
+
+    def _glass_drop(self, p: QPainter, x: float, y: float, r: float):
+        variant = int(x) % 4
+        key = ("glass", round(r * 2) / 2, variant)
+        pm = self._sprites.get(key)
+        if pm is None:
+            pm = self._sprites[key] = glass_drop_sprite(max(1.0, key[1]), variant)
+        w = pm.width() / pm.devicePixelRatio()
+        p.drawPixmap(QPointF(x - w / 2, y - w / 2), pm)
 
     def _paint_sea(self, p: QPainter, t: float):
         W, H = self.width(), self.height()
         sim = self.sim
         s = W / sim.W
-        p.drawPixmap(0, 0, self._sky_pixmap(t))
-        if self._pulse > 0.02:   # the light flickers with the bass
-            p.fillRect(QRectF(0, 0, W, H), QColor(255, 255, 255, int(28 * self._pulse)))
-
-        # the record turns at the top, dipping into the sea when a wave runs high
         panel, centre, R = self._layout(t)
-        self._paint_record(p, centre + QPointF(0, R * 0.02 * math.sin(t * 0.9)), R, "vinyl",
-                           tilt=2.0 * math.sin(t * 0.35 + self._seed))
+        centre += QPointF(0, R * 0.02 * math.sin(t * 0.9))
+        tilt = 2.0 * math.sin(t * 0.35 + self._seed)
+        self._frames += 1
+        if self._atm is None or self._frames % 3 == 0:   # 20 updates a second is plenty for slow light
+            self._atm = self._atmosphere(t, centre, R)
+            cols = np.interp((np.arange(max(32, W // 6)) * 6 + 3) / s, sim.x, sim.surface_y()) * s
+            self._under = self._underwater(t, cols)
+        p.drawImage(QRectF(0, 0, W, H), self._atm)
+
+        # the record turns at the top, swelling a touch on the beat
+        self._paint_record(p, centre, R, "vinyl", tilt=tilt, swell=1 + 0.03 * self._pulse)
         self._paint_panel(p, panel, glossy=False)
 
         # the water, in front of the record's lower half
@@ -4976,24 +5148,46 @@ class Screensaver(QWidget):
         body.lineTo(-2, H + 2)
         body.closeSubpath()
         top = float(ys.min())
-        g = QLinearGradient(0, top, 0, H)
-        g.setColorAt(0.0, QColor(95, 190, 200, 140))
-        g.setColorAt(0.3, QColor(40, 110, 128, 200))
-        g.setColorAt(1.0, QColor(8, 28, 40, 245))
+        g = QLinearGradient(0, top, 0, H)   # the wallpaper's greys, deepening into teal-black water
+        flash = int(70 * self._pulse)       # the surface lights up on a bass kick
+        g.setColorAt(0.0, QColor(min(255, 150 + flash), min(255, 190 + flash), min(255, 196 + flash), 140))
+        g.setColorAt(0.25, QColor(80, 116, 124, 196))
+        g.setColorAt(1.0, QColor(18, 28, 34, 240))
         p.fillPath(body, g)
+        # the record mirrored in the water, wobbling with the waves
+        p.save()
+        line = float(sim.surface_at(min(max(centre.x() / s, 1.0), sim.W - 1))) * s
+        p.setClipRect(QRectF(0, line + 2, W, H))   # a rectangle: clipping to the wavy surface is slow
+        p.setOpacity(0.17)
+        p.translate(centre.x() + R * 0.03 * math.sin(t * 2.3), line + (line - centre.y()) * 0.55)
+        p.scale(1.0, -0.5)   # seen at a low angle: squashed, close under the water line
+        self._paint_record(p, QPointF(0, 0), R, "vinyl", tilt=tilt)
+        p.restore()
+        # light coming down through the water
+        p.save()   # (already dark above the surface, so no clip needed)
+        p.setCompositionMode(QPainter.CompositionMode_Plus)
+        p.drawImage(QRectF(0, self._under_top, W, H - self._under_top), self._under)
+        p.restore()
+        p.setPen(Qt.NoPen)
+        for fx, fd, size, ph in self._motes:   # specks drifting in the water
+            x = (fx + 0.01 * math.sin(t * 0.3 + ph)) * W
+            line_y = float(sim.surface_at(x / s)) * s
+            depth = ((fd - t * 0.004 * size) % 1.0) * 0.9 + 0.05
+            p.setBrush(QColor(220, 245, 255, int(40 + 60 * (0.5 + 0.5 * math.sin(t * size + ph)))))
+            p.drawEllipse(QPointF(x, line_y + depth * (H - line_y)), size, size)
         for x, y, r, _ in sim.bub:
             self._blit(p, "bubble", x * s, y * s, r * s * 0.6)
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(QColor(220, 245, 255, 40), 22))
+        p.setPen(QPen(QColor(230, 248, 255, 46 + flash // 2), 22))
         p.drawPath(surf.translated(0, 12))
-        p.setPen(QPen(QColor(0, 20, 30, 80), 2.0))
+        p.setPen(QPen(QColor(0, 20, 30, 90), 2.0))
         p.drawPath(surf.translated(0, 3))
-        p.setPen(QPen(QColor(255, 255, 255, 230), 2.6))
+        p.setPen(QPen(QColor(255, 255, 255, 235), 2.6))
         p.drawPath(surf)
-        for x, y, _, _, r in sim.flying:          # spray
-            self._blit(p, "drop", x * s, y * s, r * s * 0.55)
-        for x, y, r, _ in sim.cling:               # drops on the screen's glass, like the wallpaper
-            self._blit(p, "drop", x * s, y * s, r * s * 0.7)
+        for x, y, _, _, r in sim.flying:          # spray thrown up by the bass
+            self._glass_drop(p, x * s, y * s, r * s * 0.8)
+        for x, y, r, _ in sim.cling:               # the wet glass in front of it all
+            self._glass_drop(p, x * s, y * s, r * s)
 
 
 class DiscTrayApp(QObject):

@@ -17,7 +17,7 @@ A tray-only music player for Windows. Drop an audio file on its tray icon and it
 - **Long titles** slide back and forth so you can read the whole name.
 - **Screensaver** (tray menu → Screensaver): a fullscreen view of what's playing, with the title on a glass panel and the record turning.
   - **Glossy Glass lights:** aurora curtains in colours that run round the RGB wheel, behind a glass record.
-  - **Sea:** a sea that heaves up on the bass and rolls with the odd swell, under a screen covered in drops that run down.
+  - **Sea:** the iOS water-drops wallpaper come alive. Hundreds of drops on the glass keep forming, landing, merging and running down. Behind them, out-of-focus lights drift. Below, a sea heaves and splashes on the bass, with light shafts, caustics and the record's reflection in it.
   - Nothing stays put (everything drifts slowly and the title and record swap sides every 5 minutes), so it can't burn in.
   - It starts by itself after 1.5 minutes with no keyboard or mouse input, but only while nothing on screen is moving: never over a video, a game or anything else that's playing. Any key, click or mouse move closes it. The idle start can be switched off in the same menu.
 - **Even loudness.** Volume normalization (on by default) measures every track the way streaming services do (EBU R128 / BS.1770) and plays them all at -14 LUFS, without clipping.
