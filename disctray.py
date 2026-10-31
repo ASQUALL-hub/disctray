@@ -34,7 +34,7 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.7.1"
+__version__ = "1.7.2"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
@@ -2412,6 +2412,16 @@ class SeaSim(WaterSim):
 WALLPAPER_SKY = ((0.0, (121, 174, 182)), (0.05, (112, 172, 181)), (0.12, (148, 181, 186)), (0.2, (175, 188, 190)),
                  (0.3, (191, 191, 193)), (0.5, (189, 189, 191)), (0.6, (170, 170, 171)), (0.7, (143, 143, 144)),
                  (0.8, (113, 113, 113)), (0.9, (83, 83, 83)), (1.0, (53, 53, 53)))   # sampled from the iOS water-drops wallpaper
+
+
+def wallpaper_at(f: float) -> QColor:
+    """The wallpaper's colour a share `f` of the way down the screen."""
+    f = min(1.0, max(0.0, f))
+    for (a, ca), (b, cb) in zip(WALLPAPER_SKY, WALLPAPER_SKY[1:]):
+        if f <= b:
+            k = (f - a) / (b - a) if b > a else 0.0
+            return QColor(*(int(ca[i] + (cb[i] - ca[i]) * k) for i in range(3)))
+    return QColor(*WALLPAPER_SKY[-1][1])
 
 
 def glass_drop_sprite(r: float, variant: int) -> QPixmap:
@@ -5130,8 +5140,23 @@ class Screensaver(QOpenGLWidget):
             self._under = self._underwater(t, cols)
         p.drawImage(QRectF(0, 0, W, H), self._atm)
 
-        # the record turns at the top, swelling a touch on the beat
-        self._paint_record(p, centre, R, "vinyl", tilt=tilt, swell=1 + 0.03 * self._pulse)
+        # the record turns at the top, swelling a touch on the beat, seen through the same
+        # wet glass as everything else: the wallpaper's light hazes it, its rim catches the glow
+        swell = 1 + 0.03 * self._pulse
+        self._paint_record(p, centre, R, "vinyl", tilt=tilt, swell=swell)
+        rr = R * swell
+        haze = QLinearGradient(0, centre.y() - rr, 0, centre.y() + rr)
+        for k in range(5):
+            f = k / 4
+            sky = wallpaper_at((centre.y() - rr + 2 * rr * f) / H)
+            sky.setAlpha(int(70 + 40 * f))   # more mist low down, nearer the water
+            haze.setColorAt(f, sky)
+        p.setPen(Qt.NoPen)
+        p.setBrush(haze)
+        p.drawEllipse(centre, rr, rr)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(225, 248, 252, int(90 + 80 * self._pulse)), 2.0))
+        p.drawEllipse(centre, rr - 1.5, rr - 1.5)
         self._paint_panel(p, panel, glossy=False)
 
         # the water, in front of the record's lower half
@@ -5154,15 +5179,6 @@ class Screensaver(QOpenGLWidget):
         g.setColorAt(0.25, QColor(80, 116, 124, 196))
         g.setColorAt(1.0, QColor(18, 28, 34, 240))
         p.fillPath(body, g)
-        # the record mirrored in the water, wobbling with the waves
-        p.save()
-        line = float(sim.surface_at(min(max(centre.x() / s, 1.0), sim.W - 1))) * s
-        p.setClipRect(QRectF(0, line + 2, W, H))   # a rectangle: clipping to the wavy surface is slow
-        p.setOpacity(0.17)
-        p.translate(centre.x() + R * 0.03 * math.sin(t * 2.3), line + (line - centre.y()) * 0.55)
-        p.scale(1.0, -0.5)   # seen at a low angle: squashed, close under the water line
-        self._paint_record(p, QPointF(0, 0), R, "vinyl", tilt=tilt)
-        p.restore()
         # light coming down through the water
         p.save()   # (already dark above the surface, so no clip needed)
         p.setCompositionMode(QPainter.CompositionMode_Plus)
