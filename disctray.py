@@ -33,7 +33,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.6.1"
+__version__ = "1.6.2"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
@@ -3009,10 +3009,20 @@ class DiscCard(QWidget):
         if sim is not None:
             for x, y, r, _ in sim.bub:
                 self._blit(wp, "bubble", x, y, r)
+        # keep only the water below the surface and inside the card: a full-size mask,
+        # since DestinationIn through drawPath leaves everything outside the path alone
+        clip = self._layer()
+        cp = QPainter(clip)
+        cp.setRenderHint(QPainter.Antialiasing)
+        cp.setPen(Qt.NoPen)
+        cp.setBrush(Qt.black)
+        cp.drawPath(body)
+        cp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+        card = self._card_path()
+        cp.drawImage(0, 0, self._mask("card", lambda m: m.drawPath(card)))
+        cp.end()
         wp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
-        wp.setPen(Qt.NoPen)
-        wp.setBrush(Qt.black)
-        wp.drawPath(body)
+        wp.drawImage(0, 0, clip)
         wp.end()
         p.drawImage(0, 0, water)
 
@@ -3032,7 +3042,6 @@ class DiscCard(QWidget):
             for x, y, _, _, r in sim.flying:
                 self._blit(lp, "drop", x, y, r)
         lp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
-        card = self._card_path()
         lp.drawImage(0, 0, self._mask("card", lambda m: m.drawPath(card)))
         lp.end()
         p.drawImage(0, 0, line)
