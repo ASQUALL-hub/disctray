@@ -33,7 +33,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "DiscTray"
-__version__ = "1.6.5"
+__version__ = "1.7.0"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_NAME = f"{APP_NAME}-{os.environ.get('USERNAME', 'user')}"
@@ -204,6 +204,111 @@ def caps_lock_on() -> bool:
 def tap_caps_lock() -> None:
     user32.keybd_event(VK_CAPITAL, 0x3A, 0, 0)
     user32.keybd_event(VK_CAPITAL, 0x3A, 2, 0)   # KEYEVENTF_KEYUP
+
+
+def any_key_down() -> bool:
+    """Any keyboard key held right now, whichever window has focus."""
+    return any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in range(0x08, 0xFF) if vk not in (0x01, 0x02, 0x04, 0x05, 0x06))
+
+
+# --------------------------------------------------------------------------- idle (for the screensaver)
+
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.UINT), ("dwTime", wt.DWORD)]
+
+
+user32.GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
+user32.OpenInputDesktop.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+user32.OpenInputDesktop.restype = wt.HANDLE
+user32.SwitchDesktop.argtypes = [wt.HANDLE]
+user32.CloseDesktop.argtypes = [wt.HANDLE]
+user32.SetForegroundWindow.argtypes = [wt.HWND]
+gdi32.StretchBlt.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                             wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.DWORD]
+gdi32.SetStretchBltMode.argtypes = [wt.HDC, ctypes.c_int]
+gdi32.SetBrushOrgEx.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+ctypes.windll.kernel32.GetTickCount.restype = wt.DWORD
+SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 76, 77, 78, 79
+
+
+def idle_seconds() -> float:
+    """Time since the last keyboard or mouse input anywhere."""
+    li = LASTINPUTINFO(ctypes.sizeof(LASTINPUTINFO), 0)
+    if not user32.GetLastInputInfo(ctypes.byref(li)):
+        return 0.0
+    return ((ctypes.windll.kernel32.GetTickCount() - li.dwTime) & 0xFFFFFFFF) / 1000
+
+
+def session_locked() -> bool:
+    """The lock screen owns the input desktop, so ours can't be switched to."""
+    h = user32.OpenInputDesktop(0, False, 0x0100)   # DESKTOP_SWITCHDESKTOP
+    if not h:
+        return True
+    ok = user32.SwitchDesktop(h)
+    user32.CloseDesktop(h)
+    return not ok
+
+
+def display_kept_on() -> bool:
+    """Another program asked Windows to keep the screen on (video players do)."""
+    state = wt.ULONG(0)
+    try:
+        if ctypes.windll.powrprof.CallNtPowerInformation(16, None, 0, ctypes.byref(state), 4) != 0:   # SystemExecutionState
+            return False
+    except (OSError, AttributeError):
+        return False
+    return bool(state.value & 0x2)   # ES_DISPLAY_REQUIRED
+
+
+class StillScreen:
+    """Is anything moving on screen? Compares tiny snapshots of all monitors (each
+    pixel the average of a 16x16 block), ignoring DiscTray's own windows. A playing
+    video, a game or any animation keeps changing them; a blinking caret or the
+    taskbar clock is too small to count."""
+
+    W, H = 160, 90
+    CHANGED = 10          # per-channel change that counts for one thumbnail pixel
+    MOVING = 0.002        # share of changed pixels that means something is moving
+
+    def __init__(self):
+        self.dib = _Dib(self.W, self.H)
+        self.prev: np.ndarray | None = None
+        self.prev_holes: list = []
+        self.still_since = time.monotonic()
+        self.changed = 0.0    # share of the snapshot that changed last time
+
+    def reset(self):
+        self.prev = None
+        self.still_since = time.monotonic()
+
+    def sample(self, ignore: list[tuple[int, int, int, int]]):
+        """Take a snapshot; `ignore` are screen rectangles (physical px) to leave out."""
+        vx, vy = user32.GetSystemMetrics(SM_XVIRTUALSCREEN), user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        vw, vh = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN), user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+        screen = user32.GetDC(None)
+        gdi32.SetStretchBltMode(self.dib.dc, 4)   # HALFTONE: average, don't skip pixels
+        gdi32.SetBrushOrgEx(self.dib.dc, 0, 0, None)
+        gdi32.StretchBlt(self.dib.dc, 0, 0, self.W, self.H, screen, vx, vy, vw, vh, SRCCOPY)
+        user32.ReleaseDC(None, screen)
+        cur = self.dib.arr[:, :, :3].astype(np.int16)
+        holes = []
+        for left, top, right, bottom in ignore:
+            holes.append((max(0, int((left - vx) * self.W / vw) - 1), max(0, int((top - vy) * self.H / vh) - 1),
+                          min(self.W, int((right - vx) * self.W / vw) + 2), min(self.H, int((bottom - vy) * self.H / vh) + 2)))
+        now = time.monotonic()
+        if self.prev is None:
+            self.still_since = now
+        else:
+            diff = np.abs(cur - self.prev).max(axis=2) > self.CHANGED
+            for l, t, r, b in holes + self.prev_holes:   # where our windows are now and were before
+                diff[t:b, l:r] = False
+            self.changed = float(diff.mean())
+            if self.changed > self.MOVING:
+                self.still_since = now
+        self.prev, self.prev_holes = cur, holes
+
+    def still_for(self) -> float:
+        return time.monotonic() - self.still_since
 
 
 def set_click_through(hwnd: int, on: bool) -> None:
@@ -901,6 +1006,9 @@ class AudioEngine(QObject):
 
     CHUNK = 512               # frames rendered per step
     BUFFER_S = 0.1            # what the sink holds ahead of the speakers
+    BASS_N = 2048             # bass meter window (~43 ms)
+    BASS_BAND = (35.0, 150.0) # Hz: kick drums and bass lines
+    BASS_FLOOR = 300.0        # band amplitude (int16 scale, about -40 dBFS) that counts as silence
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -917,6 +1025,17 @@ class AudioEngine(QObject):
         self._threads: set[QThread] = set()
         self._ended = False
         self._quiet = 0
+        # bass meter (the Liquid water and the screensavers dance to it)
+        self._ana = np.zeros(self.BASS_N, np.float32)   # latest output, mono, before the user's volume
+        self._ana_win = np.hanning(self.BASS_N).astype(np.float32)
+        self._last_mono: np.ndarray | None = None
+        self._bass_peak = self.BASS_FLOOR
+        self._bass_slow = 0.0
+        self._bass_t = time.perf_counter()
+        self._bass_hit_t = 0.0
+        self._bass_q: list[tuple[float, float]] = []    # (when it's heard, level)
+        self._bass_level = 0.0
+        self._hits: list[tuple[float, float]] = []      # (when it's heard, strength) of bass kicks
         self.fmt = engine_format()        # what the decoder produces
         self.out_fmt = self.fmt           # what the sink takes (converted on output)
         self.sr = ENGINE_RATE
@@ -1044,6 +1163,7 @@ class AudioEngine(QObject):
 
     # --- rendering
     def _render(self, frames: int) -> np.ndarray:
+        self._last_mono = None
         rates = np.linspace(self._rate, self.rate_target, frames, endpoint=False, dtype=np.float64)
         vols = np.linspace(self._vol, self.vol_target, frames, endpoint=False, dtype=np.float32)
         self._rate, self._vol = self.rate_target, self.vol_target
@@ -1096,8 +1216,50 @@ class AudioEngine(QObject):
         norm = np.linspace(self._norm, nxt, frames, endpoint=False, dtype=np.float32)
         self._norm = nxt
         out = sampled * (vols * norm)[:, None]
+        # the meter hears the track at its normalized loudness, fading out as the platter stops
+        self._last_mono = sampled.mean(axis=1) * norm * np.minimum(rates, 1.0).astype(np.float32)
         self._pos = end
         return out
+
+    def _meter(self, chunks: list):
+        """Bass loudness of what was just rendered, relative to the track's recent
+        peaks, and kicks where it jumps. Both are stamped with when they'll be heard
+        (the sink plays BUFFER_S behind)."""
+        fresh = np.concatenate([c if c is not None else np.zeros(self.CHUNK, np.float32) for c in chunks])
+        self._ana = np.concatenate((self._ana, fresh))[-self.BASS_N:]
+        spec = np.abs(np.fft.rfft(self._ana * self._ana_win))
+        bw = self.sr / self.BASS_N
+        lo, hi = int(math.ceil(self.BASS_BAND[0] / bw)), int(self.BASS_BAND[1] / bw) + 1
+        amp = float(np.sqrt(np.sum(spec[lo:hi] ** 2))) / (self.BASS_N / 4)   # ~ the band's amplitude
+        now = time.perf_counter()
+        dt = min(0.2, max(1e-3, now - self._bass_t))
+        self._bass_t = now
+        self._bass_peak = max(amp, self._bass_peak * math.exp(-dt / 4.0), self.BASS_FLOOR)
+        level = min(1.0, amp / self._bass_peak)
+        self._bass_slow += (level - self._bass_slow) * (1 - math.exp(-dt / 0.3))
+        heard = now + self.BUFFER_S
+        rise = level - self._bass_slow
+        if rise > 0.26 and level > 0.6 and now - self._bass_hit_t > 0.25:
+            self._bass_hit_t = now
+            self._hits = self._hits[-15:] + [(heard, min(1.0, rise * 2.2))]
+        self._bass_q.append((heard, level))
+
+    def bass_level(self) -> float:
+        """0..1: how loud the bass is right now, relative to the track's recent peaks."""
+        now = time.perf_counter()
+        q = self._bass_q
+        while q and q[0][0] <= now:
+            self._bass_level = q.pop(0)[1]
+        if len(q) > 64:
+            del q[:-64]
+        if self._timer.isActive():
+            return self._bass_level
+        return 0.0
+
+    def bass_hits(self, since: float) -> list[float]:
+        """Strengths (0..1) of the bass kicks heard after `since` (perf_counter time)."""
+        now = time.perf_counter()
+        return [s for t, s in self._hits if since < t <= now]
 
     def _convert(self, out: np.ndarray) -> bytes:
         """Stereo float (int16 scale) -> the sink's channel count and sample type."""
@@ -1129,9 +1291,13 @@ class AudioEngine(QObject):
             return
         bpf = self.out_fmt.bytesPerFrame()
         free = self._sink.bytesFree() // bpf
+        rendered = []
         while free >= self.CHUNK:
             self._io.write(self._convert(self._render(self.CHUNK)))
+            rendered.append(self._last_mono)
             free -= self.CHUNK
+        if rendered:
+            self._meter(rendered)
         self.progress.emit(self.position_ms())
         # sleep only when the record has stopped; muted playback keeps moving
         silent = self._vol == 0.0 and self.vol_target == 0.0 and self._rate == 0.0 and self.rate_target == 0.0
@@ -1980,6 +2146,12 @@ class WaterSim:
     SHOVE = 0.35         # share of the window's acceleration the water feels
     TENSION = 220.0      # px^2/s, surface tension smoothing
     MAX_FLYING, MAX_CLING, MAX_BUBBLES = 120, 90, 70
+    # bass kicks: the surface heaves up JET_H px (at full strength) over JET_T s, JET_W columns
+    # wide; the water's own physics turns that into crests that run off across the tank
+    JET_H, JET_T, JET_W = 80.0, 0.08, 2.6
+    CLING_START = 26      # drops of condensation on the glass at the start
+    CONDENSE = 0.0        # new drops forming on the glass per second
+    SLIDE_R = 2.4         # drops at least this big run down the glass
 
     def __init__(self, width: float, height: float, level_y: float, seed: int = 3):
         self.rng = np.random.default_rng(seed)
@@ -1994,8 +2166,9 @@ class WaterSim:
         self.w = np.zeros(self.N)                    # how fast the surface rises (px/s)
         self.flying = np.zeros((0, 5))               # x, y, vx, vy, r
         self.bub = np.zeros((0, 4))                  # x, y, r, wobble phase
+        self._jets: list[list[float]] = []           # x, strength, age
         # condensation on the glass above the water, like the wallpaper
-        n = 26
+        n = self.CLING_START
         r = np.clip(0.9 + self.rng.gamma(2.0, 0.55, n), 0.9, 4.2)
         self.cling = np.stack([self.rng.uniform(8, self.W - 8, n), self.rng.uniform(10, level_y - 26, n),
                                r, np.zeros(n)], axis=1)   # x, y, r, sliding speed
@@ -2012,9 +2185,29 @@ class WaterSim:
         weights = np.exp(-0.5 * ((self.x - x) / (2.2 * self.dx)) ** 2)   # a soft dent, not a notch
         self.h -= amount * 0.6 * weights / weights.sum() * 5
 
+    def kick(self, x: float, strength: float):
+        """A bass hit: the water heaves up at x like in a water speaker; the crest it
+        makes throws drops as it peaks, then runs off across the water as waves."""
+        s = max(0.0, float(strength))
+        if s <= 0:
+            return
+        self._jets.append([float(x), s, 0.0])
+
+    def _step_jets(self, dt: float):
+        for jet in self._jets:
+            x, s, age = jet
+            f = min(dt, self.JET_T - age)
+            if f > 0:
+                weights = np.exp(-0.5 * ((self.x - x) / (self.JET_W * self.dx)) ** 2)
+                self.h += weights * (s * self.JET_H * f / self.JET_T)
+            jet[2] = age + dt
+        self._jets = [j for j in self._jets if j[2] < self.JET_T]
+
     # --- one frame
     def step(self, dt: float, accel, stir: float) -> bool:
         rng = self.rng
+        if self._jets:
+            self._step_jets(dt)
         # the water feels only part of the window's acceleration (window moves are fast
         # in pixel terms; full strength would slosh it about on the slightest drag)
         ax, ay = accel[0] * self.SHOVE, accel[1] * self.SHOVE
@@ -2078,7 +2271,8 @@ class WaterSim:
         self._step_cling(dt)
         self._step_bubbles(dt)
         moving = float(np.abs(u).max()) > 2 or float(np.abs(self.w).max()) > 2
-        return moving or len(self.flying) > 0 or len(self.bub) > 0 or bool((self.cling[:, 3] > 0).any()) or stir > 0
+        return moving or len(self.flying) > 0 or len(self.bub) > 0 or bool((self.cling[:, 3] > 0).any()) \
+            or stir > 0 or bool(self._jets)
 
     def _step_flying(self, dt, ax, ay):
         f = self.flying
@@ -2120,10 +2314,18 @@ class WaterSim:
             c[i, 1] = (c[i, 1] * vi + c[j, 1] * vj) / (vi + vj)
             c[i, 2] = (vi + vj) ** (1 / 3)
             c = np.delete(c, j, axis=0)
+        # new condensation keeps forming on the glass above the water
+        if self.CONDENSE and len(c) < self.MAX_CLING:
+            k = min(self.MAX_CLING - len(c), int(rng.poisson(self.CONDENSE * dt)))
+            if k:
+                x = rng.uniform(4, self.W - 4, k)
+                y = rng.uniform(4, np.maximum(6, self.surface_at(x) - 10))
+                c = np.vstack([c, np.stack([x, y, rng.uniform(0.8, 1.6, k), np.zeros(k)], axis=1)])
         # heavy drops run down in fits and starts, leaving tiny droplets behind
-        big = c[:, 2] > 2.4
-        start = big & (c[:, 3] == 0) & (rng.random(len(c)) < 0.8 * dt * (c[:, 2] - 2.4))
-        c[start, 3] = (c[start, 2] - 2.4) * 22 + 6
+        slide = self.SLIDE_R
+        big = c[:, 2] > slide
+        start = big & (c[:, 3] == 0) & (rng.random(len(c)) < 0.8 * dt * (c[:, 2] - slide))
+        c[start, 3] = (c[start, 2] - slide) * 22 + 6
         stop = (c[:, 3] > 0) & (rng.random(len(c)) < dt * 1.2)
         c[stop, 3] = 0
         c[:, 1] += c[:, 3] * dt
@@ -2152,6 +2354,17 @@ class WaterSim:
         for x, r in b[popped][:, [0, 2]]:
             self._dip(x, -0.05 * r)
         self.bub = b[~popped]
+
+
+class SeaSim(WaterSim):
+    """The screensaver's sea: the card's water on a wide tank (drawn scaled up to the
+    screen), with more room for spray, bubbles and drops on the glass, and big heaves."""
+
+    N = 160
+    MAX_FLYING, MAX_CLING, MAX_BUBBLES = 320, 520, 160
+    JET_H, JET_T, JET_W = 130.0, 0.1, 3.4
+    FRICTION = 1.5        # calmer than the card, so the beats don't pile up into chaos
+    CLING_START, CONDENSE, SLIDE_R = 300, 26.0, 1.9   # a wet screen, like the wallpaper
 
 
 def drop_sprite(r: float, kind: str) -> QPixmap:
@@ -2663,6 +2876,7 @@ class DiscCard(QWidget):
         self._snow: SnowSim | None = None
         self._water: WaterSim | None = None
         self._sim_t = 0.0
+        self._bass_seen = 0.0   # bass kicks up to this time are already in the water
         self._win_prev = QPointF()
         self._win_v = QPointF()
         self._accel = (0.0, 0.0)
@@ -2781,7 +2995,7 @@ class DiscCard(QWidget):
 
     def _wake_sim(self):
         if self.player.style in ("snow", "liquid") and self.isVisible() and not self._sim_timer.isActive():
-            self._sim_t = time.perf_counter()
+            self._sim_t = self._bass_seen = time.perf_counter()
             self._win_prev = QPointF(self.pos())
             self._win_v = QPointF()
             self._sim_timer.start()
@@ -2810,6 +3024,9 @@ class DiscCard(QWidget):
         else:
             if self._water is None:
                 self._water = WaterSim(self.W, self.H, self.H * WATER_LEVEL)
+            for s in self.player.engine.bass_hits(self._bass_seen):   # dance to the bass, like a water speaker
+                self._water.kick(self.W * (0.5 + random.uniform(-0.14, 0.14)), 0.35 + 0.65 * s)
+            self._bass_seen = now
             active = self._water.step(dt, (ax, ay), stir)
         self.update()
         if not active and abs(v.x()) + abs(v.y()) < 1 and abs(ax) + abs(ay) < 1:
@@ -4435,6 +4652,350 @@ class DropCatcher(QWidget):
 
 # --------------------------------------------------------------------------- app
 
+SAVER_IDLE_S = 90.0     # no keyboard or mouse input for this long...
+SAVER_STILL_S = 15.0    # ...and nothing moving on screen for this long: start the screensaver
+SAVER_SCENES = {"glossy": "Glossy Glass lights", "sea": "Sea"}
+
+
+class Screensaver(QWidget):
+    """Fullscreen view of what's playing, for when the PC sits idle. Nothing on it
+    stays put, so nothing burns in: the record and title drift slowly around the
+    screen and the light (Glossy Glass) or the sea (Liquid) never repeats. Both
+    pulse to the bass. Any key, click or real mouse movement closes it."""
+
+    exited = Signal()
+    ARM_S = 0.8      # ignore input this soon after opening (the click or move that started it)
+    SWAP_S = 300.0   # the title and the record trade sides this often (s), gliding over 3 s
+    # Glossy Glass aurora curtains: lower edge height, wave size, waves across, drift speed,
+    # curtain height, hue offset (all as shares of the screen / cycles)
+    RIBBONS = ((0.46, 0.07, 0.8, 0.016, 0.30, 0.0), (0.62, 0.05, 1.3, -0.011, 0.22, 0.33),
+               (0.34, 0.06, 0.55, 0.008, 0.26, 0.66))
+
+    def __init__(self, player: "Player", scene: str, screen):
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.player, self.scene = player, scene
+        self.setAttribute(Qt.WA_OpaquePaintEvent)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setCursor(Qt.BlankCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setWindowTitle(f"{APP_NAME} screensaver")
+        self.setGeometry(screen.geometry())
+        rng = random.Random()
+        self._rng = rng
+        self._seed = rng.uniform(0, 100)
+        self._t0 = self._last = time.perf_counter()
+        self._armed = False
+        self._cursor = QCursor.pos()
+        self._bass_seen = self._t0
+        self._pulse = 0.0                       # flares up on a bass kick, then fades
+        self._discs: dict = {}
+        self._sprites: dict = {}
+        self._aurora: QImage | None = None      # the light show, computed small and scaled up
+        self._aurora_buf: np.ndarray | None = None
+        self._frames = 0
+        self._sky: QPixmap | None = None
+        self._sky_t = -1e9
+        self._stars = [(rng.random(), rng.random() * 0.9, rng.uniform(0.6, 1.8), rng.uniform(0, 6.3), rng.uniform(0.5, 1.6))
+                       for _ in range(140)]
+        self.sim: SeaSim | None = None
+        if scene == "sea":
+            w = 640.0
+            h = w * self.height() / max(1, self.width())
+            self.sim = SeaSim(w, h, h * 0.6, seed=rng.randrange(1 << 30))
+            self._wave = (0.0, 0.0)             # sideways shove of a passing swell, and until when
+            self._next_wave = self._t0 + rng.uniform(4, 10)
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.PreciseTimer)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._frame)
+
+    # --- life
+    def showEvent(self, e):
+        self.player.add_viewer()   # keeps the record turning
+        self._timer.start()
+        super().showEvent(e)
+
+    def closeEvent(self, e):
+        self._timer.stop()
+        self.player.remove_viewer()
+        super().closeEvent(e)
+
+    def _wake(self):
+        if self._armed:
+            self.exited.emit()
+
+    def keyPressEvent(self, e):
+        self._wake()
+
+    def mousePressEvent(self, e):
+        self._wake()
+
+    def wheelEvent(self, e):
+        self._wake()
+
+    def _frame(self):
+        now = time.perf_counter()
+        dt = min(0.05, max(1e-3, now - self._last))
+        self._last = now
+        if not self._armed:
+            if now - self._t0 >= self.ARM_S:
+                self._armed, self._cursor = True, QCursor.pos()
+        elif (QCursor.pos() - self._cursor).manhattanLength() > 12 or any_mouse_button_down() or any_key_down():
+            self.exited.emit()
+            return
+        for s in self.player.engine.bass_hits(self._bass_seen):
+            self._pulse = max(self._pulse, s)
+            if self.sim is not None:   # the sea's "speaker": the water heaves up on the bass
+                self.sim.kick(self.sim.W * self._rng.uniform(0.2, 0.8), 0.8 * (0.5 + 0.5 * s))
+        self._bass_seen = now
+        self._pulse *= math.exp(-dt / 0.28)
+        if self.sim is not None:
+            self._step_sea(now, dt)
+        self.update()
+
+    def _step_sea(self, now: float, dt: float):
+        rng, sim = self._rng, self.sim
+        if now >= self._next_wave:   # now and then a gentle swell rolls in from one side
+            self._wave = (rng.choice((-1, 1)) * rng.uniform(700, 1500), now + rng.uniform(0.25, 0.6))
+            self._next_wave = now + rng.uniform(10, 22)
+        ax = self._wave[0] if now < self._wave[1] else 0.0
+        sim.step(dt, (ax, 0.0), 0.6 * self.player.rate)
+
+    # --- shared pieces
+    def _layout(self, t: float) -> tuple[QRectF, QPointF, float]:
+        """Title panel at the top on one side, the record at the top on the other
+        (radius R). Both drift a little all the time, and every SWAP_S they glide
+        over to the other side, so no edge sits on the same pixels for long."""
+        W, H, s = self.width(), self.height(), self._seed
+        R = min(W, H) * 0.25
+        side = int(t // self.SWAP_S) % 2           # 0: title left, record right
+        since = t % self.SWAP_S
+        m = float(side)
+        if t >= self.SWAP_S and since < 3.0:       # gliding across
+            e = 0.5 - 0.5 * math.cos(math.pi * since / 3.0)
+            m = (1 - side) + (2 * side - 1) * e
+        dx = W * 0.012 * math.sin(t / 53 + s) + W * 0.004 * math.sin(t / 13 + 2 * s)
+        dy = H * 0.016 * math.sin(t / 41 + 2 * s) + H * 0.005 * math.sin(t / 17 + s)
+        pw, ph = W * 0.27, H * 0.25
+        left, right = W * 0.05, W * 0.95 - pw
+        panel = QRectF(left + (right - left) * m + dx, H * 0.1 + dy, pw, ph)
+        rec_l, rec_r = W * 0.05 + R, W * 0.95 - R
+        centre = QPointF(rec_r + (rec_l - rec_r) * m - dx * 0.7, H * 0.06 + R - dy * 0.6)
+        return panel, centre, R
+
+    def _paint_panel(self, p: QPainter, rect: QRectF, glossy: bool):
+        """Big title and time on a soft glass panel."""
+        pl = self.player
+        H = self.height()
+        path = _rounded(rect, H * 0.022)
+        p.setPen(Qt.NoPen)
+        fill = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+        if glossy:
+            fill.setColorAt(0.0, QColor(255, 255, 255, 34))
+            fill.setColorAt(0.5, QColor(255, 255, 255, 12))
+            fill.setColorAt(1.0, QColor(255, 255, 255, 20))
+        else:
+            fill.setColorAt(0.0, QColor(255, 255, 255, 60))
+            fill.setColorAt(1.0, QColor(255, 255, 255, 34))
+        p.fillPath(path, fill)
+        p.setPen(QPen(QColor(255, 255, 255, 80 if glossy else 90), 1.2))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+        if not pl.path:
+            return
+        pad = rect.width() * 0.08
+        size = H * 0.08
+        font = ui_font(size * 0.75, QFont.Bold)
+        while QFontMetricsF(font).horizontalAdvance(pl.title) > rect.width() - 2 * pad and size > H * 0.03:
+            size *= 0.92   # long titles get smaller first, then cut short
+            font = ui_font(size * 0.75, QFont.Bold)
+        title = QFontMetricsF(font).elidedText(pl.title, Qt.ElideRight, rect.width() - 2 * pad)
+        trect = QRectF(rect.left() + pad, rect.top() + rect.height() * 0.16, rect.width() - 2 * pad, rect.height() * 0.38)
+        wrect = QRectF(rect.left() + pad, rect.top() + rect.height() * 0.56, rect.width() - 2 * pad, rect.height() * 0.28)
+        when = f"{fmt_time(pl.position())}  /  {fmt_time(pl.duration())}"
+        small = ui_font(H * 0.04 * 0.75, QFont.DemiBold)
+        if glossy:
+            glossy_text(p, trect, title, font)
+            p.setFont(small)
+            shadow_text(p, wrect, Qt.AlignCenter, when, QColor(235, 240, 248, 215))
+            return
+        for f, r, text, ink in ((font, trect, title, QColor(16, 46, 54, 240)), (small, wrect, when, QColor(30, 62, 70, 220))):
+            p.setFont(f)
+            p.setPen(QColor(255, 255, 255, 130))
+            p.drawText(r.translated(0, 1.5), Qt.AlignCenter, text)
+            p.setPen(ink)
+            p.drawText(r, Qt.AlignCenter, text)
+
+    def _disc(self, kind: str, px: int):
+        pl = self.player
+        key = (pl.path, px, kind)
+        hit = self._discs.get(key)
+        if hit is None:
+            self._discs.clear()
+            if kind == "glass":
+                hit = (render_glass_disc(pl.art, px, pl.seed, empty=pl.path is None), render_glossy_sheen(px))
+            else:
+                hit = (render_disc(pl.art, px, pl.seed, empty=pl.path is None), render_sheen(px))
+            self._discs[key] = hit
+        return hit
+
+    def _paint_record(self, p: QPainter, c: QPointF, R: float, kind: str, tilt: float = 0.0, swell: float = 1.0):
+        """The record at radius R (rendered once at that size), drawn `swell` times bigger."""
+        disc, sheen = self._disc(kind, max(64, round(2 * R * self.devicePixelRatioF())))
+        target = QRectF(-R, -R, 2 * R, 2 * R)
+        p.save()
+        p.translate(c)
+        p.scale(swell, swell)
+        p.rotate(tilt)
+        p.save()
+        p.rotate(self.player.angle)
+        p.drawPixmap(target, disc, QRectF(disc.rect()))
+        p.restore()
+        p.drawPixmap(target, sheen, QRectF(sheen.rect()))
+        p.restore()
+
+    def _sprite(self, kind: str, r: float) -> QPixmap:
+        key = (kind, round(r * 2) / 2)
+        pm = self._sprites.get(key)
+        if pm is None:
+            pm = self._sprites[key] = drop_sprite(max(0.8, key[1]), kind)
+        return pm
+
+    def _blit(self, p: QPainter, kind: str, x: float, y: float, r: float):
+        pm = self._sprite(kind, r)
+        w = pm.width() / pm.devicePixelRatio()
+        p.drawPixmap(QPointF(x - w / 2, y - w / 2), pm)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
+        t = time.perf_counter() - self._t0
+        if self.scene == "sea":
+            self._paint_sea(p, t)
+        else:
+            self._paint_lights(p, t)
+        p.end()
+
+    # --- Glossy Glass: aurora curtains in colours that run round the RGB wheel
+    @staticmethod
+    def _hue_rgb(h: np.ndarray) -> np.ndarray:
+        h6 = (h % 1.0)[:, None] * 6.0
+        rgb = np.clip(np.concatenate([np.abs(h6 - 3) - 1, 2 - np.abs(h6 - 2), 2 - np.abs(h6 - 4)], axis=1), 0, 1)
+        return rgb * 0.82 + 0.18   # a little white in it, like real aurora light
+
+    def _aurora_image(self, t: float) -> QImage:
+        """Curtains of light: a sharp lower edge that waves and drifts, light streaming
+        up from it in shimmering rays, hues sliding along the curtain and around the
+        colour wheel over time. Computed small (numpy) and scaled up by the painter."""
+        W, H = self.width(), self.height()
+        lw, lh = max(32, W // 6), max(18, H // 6)
+        x = np.linspace(0.0, 1.0, lw, dtype=np.float32)
+        y = np.linspace(0.0, 1.0, lh, dtype=np.float32)[:, None]
+        sky = np.empty((lh, lw, 3), np.float32)
+        sky[:] = (0.010 + 0.02 * y)[:, :, None] * np.array([0.6, 0.8, 1.6], np.float32)
+        boost = 0.8 + 0.35 * self.player.engine.bass_level() + 0.6 * self._pulse
+        hue0 = t * 0.03 + self._seed
+        for k, (base, amp, waves, speed, length, dh) in enumerate(self.RIBBONS):
+            ph = self._seed * (k + 1)
+            edge = (base + amp * np.sin(2 * np.pi * (waves * x + speed * t) + ph)
+                    + 0.025 * np.sin(2 * np.pi * (2.9 * x - 0.05 * t) + 2 * ph))
+            reach = length * (0.65 + 0.35 * np.sin(2 * np.pi * (1.1 * x + 0.04 * t) + ph))
+            rays = (0.7 + 0.18 * np.sin(2 * np.pi * (13 * x + 0.22 * t) + ph) * np.sin(2 * np.pi * (4.3 * x - 0.13 * t) + 3 * ph)
+                    + 0.12 * np.sin(2 * np.pi * (29 * x - 0.4 * t) + 2 * ph))   # soft folds that shimmer
+            glow = rays * (0.55 + 0.45 * np.sin(2 * np.pi * (0.6 * x - 0.03 * t) + 2 * ph)) * boost
+            d = edge - y                                   # above the lower edge: > 0
+            inten = np.where(d >= 0, np.exp(-d / reach), np.exp(d / 0.015))
+            color = self._hue_rgb(hue0 + dh + 0.45 * x) * glow[:, None]
+            sky += inten[:, :, None] * color[None, :, :] * 0.85
+        out = (255 * (1 - np.exp(-1.6 * sky))).astype(np.uint8)   # soft roll-off instead of clipping
+        self._aurora_buf = np.ascontiguousarray(out)
+        return QImage(self._aurora_buf.data, lw, lh, 3 * lw, QImage.Format_RGB888)
+
+    def _paint_lights(self, p: QPainter, t: float):
+        W, H = self.width(), self.height()
+        self._frames += 1
+        if self._aurora is None or self._frames % 2 == 0:   # 30 updates a second is plenty for slow light
+            self._aurora = self._aurora_image(t)
+        p.drawImage(QRectF(0, 0, W, H), self._aurora)
+        p.setPen(Qt.NoPen)
+        for fx, fy, size, ph, speed in self._stars:   # twinkling stars behind the light
+            a = 0.5 + 0.5 * math.sin(t * 1.3 * speed + ph)
+            p.setBrush(QColor(255, 255, 255, int(150 * a * a)))
+            x = ((fx + t * 0.0015 * speed) % 1.0) * W
+            p.drawEllipse(QPointF(x, fy * H), size, size)
+        panel, centre, R = self._layout(t)
+        self._paint_record(p, centre, R, "glass", swell=1 + 0.025 * self._pulse)   # swells a touch on the beat
+        self._paint_panel(p, panel, glossy=True)
+
+    # --- Liquid: a sea that sloshes, swells and heaves to the bass, the record turning above it
+    def _sky_pixmap(self, t: float) -> QPixmap:
+        if self._sky is None or t - self._sky_t > 3.0:   # drifts slowly, so redrawn now and then
+            W, H = self.width(), self.height()
+            pm = QPixmap(W, H)
+            sp = QPainter(pm)
+            shift = 0.04 * math.sin(t / 60 + self._seed)
+            g = QLinearGradient(0, 0, 0, H)
+            g.setColorAt(0.0, QColor.fromHsvF((0.51 + shift) % 1.0, 0.62, 0.7))
+            g.setColorAt(0.3, QColor.fromHsvF((0.52 + shift) % 1.0, 0.18, 0.82))
+            g.setColorAt(0.6, QColor.fromHsvF((0.55 + shift) % 1.0, 0.05, 0.72))
+            g.setColorAt(1.0, QColor.fromHsvF((0.55 + shift) % 1.0, 0.06, 0.28))
+            sp.fillRect(0, 0, W, H, g)
+            glow = QRadialGradient(QPointF(W * (0.5 + 0.3 * math.sin(t / 90 + self._seed)), H * 0.08), W * 0.45)
+            glow.setColorAt(0.0, QColor(255, 255, 255, 70))
+            glow.setColorAt(1.0, QColor(255, 255, 255, 0))
+            sp.fillRect(0, 0, W, H, glow)
+            sp.end()
+            self._sky, self._sky_t = pm, t
+        return self._sky
+
+    def _paint_sea(self, p: QPainter, t: float):
+        W, H = self.width(), self.height()
+        sim = self.sim
+        s = W / sim.W
+        p.drawPixmap(0, 0, self._sky_pixmap(t))
+        if self._pulse > 0.02:   # the light flickers with the bass
+            p.fillRect(QRectF(0, 0, W, H), QColor(255, 255, 255, int(28 * self._pulse)))
+
+        # the record turns at the top, dipping into the sea when a wave runs high
+        panel, centre, R = self._layout(t)
+        self._paint_record(p, centre + QPointF(0, R * 0.02 * math.sin(t * 0.9)), R, "vinyl",
+                           tilt=2.0 * math.sin(t * 0.35 + self._seed))
+        self._paint_panel(p, panel, glossy=False)
+
+        # the water, in front of the record's lower half
+        xs, ys = sim.x * s, sim.surface_y() * s
+        surf = QPainterPath()
+        surf.moveTo(-2, float(ys[0]))
+        surf.lineTo(float(xs[0]), float(ys[0]))
+        for i in range(1, len(xs)):
+            surf.quadTo(QPointF(float(xs[i - 1]), float(ys[i - 1])),
+                        QPointF(float(xs[i - 1] + xs[i]) / 2, float(ys[i - 1] + ys[i]) / 2))
+        surf.lineTo(W + 2, float(ys[-1]))
+        body = QPainterPath(surf)
+        body.lineTo(W + 2, H + 2)
+        body.lineTo(-2, H + 2)
+        body.closeSubpath()
+        top = float(ys.min())
+        g = QLinearGradient(0, top, 0, H)
+        g.setColorAt(0.0, QColor(95, 190, 200, 140))
+        g.setColorAt(0.3, QColor(40, 110, 128, 200))
+        g.setColorAt(1.0, QColor(8, 28, 40, 245))
+        p.fillPath(body, g)
+        for x, y, r, _ in sim.bub:
+            self._blit(p, "bubble", x * s, y * s, r * s * 0.6)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(220, 245, 255, 40), 22))
+        p.drawPath(surf.translated(0, 12))
+        p.setPen(QPen(QColor(0, 20, 30, 80), 2.0))
+        p.drawPath(surf.translated(0, 3))
+        p.setPen(QPen(QColor(255, 255, 255, 230), 2.6))
+        p.drawPath(surf)
+        for x, y, _, _, r in sim.flying:          # spray
+            self._blit(p, "drop", x * s, y * s, r * s * 0.55)
+        for x, y, r, _ in sim.cling:               # drops on the screen's glass, like the wallpaper
+            self._blit(p, "drop", x * s, y * s, r * s * 0.7)
+
+
 class DiscTrayApp(QObject):
     def __init__(self, server: QLocalServer, initial: list[str]):
         super().__init__()
@@ -4490,6 +5051,22 @@ class DiscTrayApp(QObject):
         self.act_next = self.menu.addAction("Next track", self.player.next)
         self.menu.addAction("Open audio files…", self.open_file)
         self.act_pop = self.menu.addAction("Pop out", self.toggle_popout)
+        saver_menu = self.menu.addMenu("Screensaver")
+        for key, name in SAVER_SCENES.items():
+            saver_menu.addAction(name, lambda k=key: self.start_saver(k))
+        saver_menu.addSeparator()
+        self.act_saver_idle = QAction("Start when the PC is idle (1.5 min, still screen)", saver_menu, checkable=True)
+        self.act_saver_idle.setChecked(self.cfg.get("saver_idle", True))
+        self.act_saver_idle.toggled.connect(self.set_saver_idle)
+        saver_menu.addAction(self.act_saver_idle)
+        self.savers: list[Screensaver] = []
+        self._saver_pop = False   # the pop-out was showing when the screensaver started
+        self._saver_prev_fg = None
+        self._still: StillScreen | None = None
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setInterval(2000)
+        self._idle_timer.timeout.connect(self._poll_idle)
+        self._idle_timer.start()
         self.player.style = self.cfg.get("style") if self.cfg.get("style") in STYLES else "glassy"
         style_menu = self.menu.addMenu("Style")
         group = QActionGroup(style_menu)
@@ -4742,6 +5319,82 @@ class DiscTrayApp(QObject):
             self.show_popout()
             self.hide_panel()
 
+    # --- screensaver
+    def start_saver(self, scene: str):
+        """Cover every screen with the screensaver until the next key, click or mouse move."""
+        if self.savers:
+            return
+        self.cfg["saver_scene"] = scene
+        save_config(self.cfg)
+        self._saver_prev_fg = user32.GetForegroundWindow()
+        if self.panel.isVisible():
+            self.hide_panel()
+        self._saver_pop = self._pop_showing()
+        if self._saver_pop:
+            self.pop.hide()
+        self.hud.hide()
+        under = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+        for screen in QGuiApplication.screens():
+            saver = Screensaver(self.player, scene, screen)
+            saver.exited.connect(self.stop_saver)
+            self.savers.append(saver)
+            saver.show()
+            if screen is under:   # takes the keyboard, so the key that wakes the PC isn't typed anywhere
+                saver.raise_()
+                saver.activateWindow()
+
+    def stop_saver(self):
+        savers, self.savers = self.savers, []
+        if not savers:
+            return
+        for saver in savers:
+            saver.close()
+        if self._saver_pop:
+            self.pop.show()
+            self._saver_pop = False
+        if self._saver_prev_fg:   # give the keyboard back to whatever had it
+            user32.SetForegroundWindow(self._saver_prev_fg)
+        if self._still is not None:
+            self._still.reset()
+
+    def set_saver_idle(self, on: bool):
+        self.cfg["saver_idle"] = on
+        save_config(self.cfg)
+
+    def _idle_scene(self) -> str:
+        """The scene that fits the style in use; otherwise the one started last."""
+        return {"glossy": "glossy", "liquid": "sea"}.get(self.player.style, self.cfg.get("saver_scene", "glossy"))
+
+    def _own_rects(self) -> list[tuple[int, int, int, int]]:
+        rects = []
+        for w in (self.panel, self.pop, self.hud):
+            if w.isVisible():
+                g, dpr = w.frameGeometry(), w.devicePixelRatioF()
+                rects.append((int(g.left() * dpr), int(g.top() * dpr), int((g.right() + 1) * dpr), int((g.bottom() + 1) * dpr)))
+        return rects
+
+    def _poll_idle(self):
+        """Every 2 s: start the screensaver once nobody has touched the PC for
+        SAVER_IDLE_S and nothing has moved on screen for SAVER_STILL_S (so never over
+        a video, a game or anything else that's playing)."""
+        if self.savers:
+            if session_locked():   # no point drawing behind the lock screen
+                self.stop_saver()
+            return
+        if not self.act_saver_idle.isChecked():
+            return
+        idle = idle_seconds()
+        if idle < SAVER_IDLE_S - SAVER_STILL_S - 10:
+            if self._still is not None:
+                self._still.reset()
+            return
+        if self._still is None:
+            self._still = StillScreen()
+        self._still.sample(self._own_rects())
+        if idle >= SAVER_IDLE_S and self._still.still_for() >= SAVER_STILL_S \
+                and not foreground_is_fullscreen() and not display_kept_on() and not session_locked():
+            self.start_saver(self._idle_scene())
+
     def _save_pop_pos(self, pos: QPoint):
         if self.pop.summoned:   # dragged somewhere new while visiting the tray: that's home now
             self.pop.summoned = self.pop.preview = False
@@ -4968,6 +5621,7 @@ class DiscTrayApp(QObject):
         save_config(self.cfg)
 
     def quit(self):
+        self.stop_saver()
         self._save_position()
         for card in (self.panel, self.pop, self.hud):
             card.backdrop.stop()

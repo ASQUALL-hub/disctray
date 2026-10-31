@@ -15,6 +15,11 @@ A tray-only music player for Windows. Drop an audio file on its tray icon and it
 - **Scrub.** Hold **Ctrl** and grab the record: drag right to skip ahead, left to go back. The record turns under your hand and a ring shows where you are in the song.
 - **Picks up where you left off.** The track and position are saved when DiscTray closes, and playback resumes there next time.
 - **Long titles** slide back and forth so you can read the whole name.
+- **Screensaver** (tray menu → Screensaver): a fullscreen view of what's playing, with the title on a glass panel and the record turning.
+  - **Glossy Glass lights:** aurora curtains in colours that run round the RGB wheel, behind a glass record.
+  - **Sea:** a sea that heaves up on the bass and rolls with the odd swell, under a screen covered in drops that run down.
+  - Nothing stays put (everything drifts slowly and the title and record swap sides every 5 minutes), so it can't burn in.
+  - It starts by itself after 1.5 minutes with no keyboard or mouse input, but only while nothing on screen is moving: never over a video, a game or anything else that's playing. Any key, click or mouse move closes it. The idle start can be switched off in the same menu.
 - **Even loudness.** Volume normalization (on by default) measures every track the way streaming services do (EBU R128 / BS.1770) and plays them all at -14 LUFS, without clipping.
 - **Hi-Res.** Lossless files (FLAC, WAV, AIFF, ALAC...) get a small *Hi-Res* tag under the title.
 - **Throw it.** Turn on *Bouncy pop-out* (Settings; off each time the app starts), then fling the pop-out and it keeps its momentum and bounces off the screen edges.
@@ -25,7 +30,7 @@ A tray-only music player for Windows. Drop an audio file on its tray icon and it
   - **Glossy Glass:** a glass record and glossy lettering.
   - **Frutiger Aero.**
   - **Snow Globe:** snow with physics. Shake the pop-out!
-  - **Liquid:** the record sits behind a wet pane of glass like the iOS water-drops wallpaper (teal fading to grey, glossy, beaded with drops), in clear water that sloshes (real shallow-water physics), throws droplets that cling to the glass and run down, and fills with bubbles when shaken hard.
+  - **Liquid:** the record sits behind a wet pane of glass like the iOS water-drops wallpaper (teal fading to grey, glossy, beaded with drops), in clear water that heaves up on the bass like a water speaker and sloshes (real shallow-water physics), throws droplets that cling to the glass and run down, and fills with bubbles when shaken hard.
   - **Record Player:** a suitcase turntable whose tonearm swings onto the record when you press play and follows the groove inward as the song plays.
 
 ## Install
